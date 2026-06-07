@@ -4,10 +4,9 @@
 \set ON_ERROR_STOP on
 
 CREATE SCHEMA test_recall_gamma;
-SET search_path = test_recall_gamma, public;
-
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_acorn;
+SET search_path = test_recall_gamma, public;
 
 CREATE TABLE items (
     id        serial PRIMARY KEY,

@@ -5,10 +5,9 @@
 \set ON_ERROR_STOP on
 
 CREATE SCHEMA test_no_regression;
-SET search_path = test_no_regression, public;
-
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_acorn;
+SET search_path = test_no_regression, public;
 
 CREATE TABLE items (
     id        serial PRIMARY KEY,
