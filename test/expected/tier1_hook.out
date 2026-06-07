@@ -1,0 +1,55 @@
+-- tier1_hook.sql: Tier 1 hook intercepts USING hnsw + WHERE and injects AcornScan
+-- TDD: golden file starts empty; populate after implementation passes
+\set ON_ERROR_STOP on
+CREATE SCHEMA test_tier1;
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+NOTICE:  extension "pg_acorn" already exists, skipping
+SET search_path = test_tier1, public;
+SET pg_acorn.enable_hook = on;
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    category  text,
+    embedding vector(4)
+);
+INSERT INTO items (category, embedding) SELECT
+    CASE WHEN i % 5 = 0 THEN 'shoes' ELSE 'other' END,
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 200) i;
+-- Tier 1: existing hnsw index, no rebuild
+CREATE INDEX items_hnsw_idx ON items USING hnsw (embedding vector_cosine_ops);
+-- planner must choose Custom Scan (AcornScan), not Seq Scan
+\set VERBOSITY verbose
+EXPLAIN (COSTS OFF)
+SELECT id FROM items
+WHERE category = 'shoes'
+ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
+LIMIT 5;
+NOTICE:  00000: ACORN-DBG: plan_custom_path entered, tlist len=2
+LOCATION:  acorn_plan_custom_path, acorn_hook.c:387
+NOTICE:  00000: ACORN-DBG: tlist[0] expr_tag=6 resjunk=0
+LOCATION:  acorn_plan_custom_path, acorn_hook.c:394
+NOTICE:  00000: ACORN-DBG: tlist[1] expr_tag=6 resjunk=0
+LOCATION:  acorn_plan_custom_path, acorn_hook.c:394
+NOTICE:  00000: ACORN-DBG: begin_scan entered, custom_private len=3
+LOCATION:  acorn_begin_scan, acorn_hook.c:465
+NOTICE:  00000: ACORN-DBG: reading indexoid, tag[0]=460
+LOCATION:  acorn_begin_scan, acorn_hook.c:469
+NOTICE:  00000: ACORN-DBG: indexoid=17064, reading k, tag[2]=460
+LOCATION:  acorn_begin_scan, acorn_hook.c:471
+NOTICE:  00000: ACORN-DBG: k=5, opening index
+LOCATION:  acorn_begin_scan, acorn_hook.c:473
+NOTICE:  00000: ACORN-DBG: index opened
+LOCATION:  acorn_begin_scan, acorn_hook.c:476
+NOTICE:  00000: ACORN-DBG: begin_scan done
+LOCATION:  acorn_begin_scan, acorn_hook.c:489
+NOTICE:  00000: ACORN-DBG: explain_scan entered
+LOCATION:  acorn_explain_scan, acorn_hook.c:604
+NOTICE:  00000: ACORN-DBG: after PropertyText
+LOCATION:  acorn_explain_scan, acorn_hook.c:606
+NOTICE:  00000: ACORN-DBG: explain_scan done
+LOCATION:  acorn_explain_scan, acorn_hook.c:609
+ERROR:  XX000: unrecognized node type: 0
+LOCATION:  ExecEndNode, execProcnode.c:755

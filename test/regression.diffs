@@ -1,12 +1,12 @@
 diff -U3 /workspace/test/expected/tier1_hook.out /workspace/test/results/tier1_hook.out
---- /workspace/test/expected/tier1_hook.out	2026-06-07 16:16:56.892346393 +0000
-+++ /workspace/test/results/tier1_hook.out	2026-06-07 16:16:57.118963426 +0000
-@@ -29,7 +29,7 @@
- NOTICE:  ACORN-DBG: plan_custom_path entered, tlist len=2
- NOTICE:  ACORN-DBG: begin_scan entered, custom_private len=3
- NOTICE:  ACORN-DBG: reading indexoid, tag[0]=460
--NOTICE:  ACORN-DBG: indexoid=17064, reading k, tag[2]=460
-+NOTICE:  ACORN-DBG: indexoid=17414, reading k, tag[2]=460
- NOTICE:  ACORN-DBG: k=5, opening index
- NOTICE:  ACORN-DBG: index opened
- NOTICE:  ACORN-DBG: begin_scan done
+--- /workspace/test/expected/tier1_hook.out	2026-06-07 16:39:59.322002930 +0000
++++ /workspace/test/results/tier1_hook.out	2026-06-07 16:40:01.290530123 +0000
+@@ -37,7 +37,7 @@
+ LOCATION:  acorn_begin_scan, acorn_hook.c:465
+ NOTICE:  00000: ACORN-DBG: reading indexoid, tag[0]=460
+ LOCATION:  acorn_begin_scan, acorn_hook.c:469
+-NOTICE:  00000: ACORN-DBG: indexoid=17064, reading k, tag[2]=460
++NOTICE:  00000: ACORN-DBG: indexoid=17414, reading k, tag[2]=460
+ LOCATION:  acorn_begin_scan, acorn_hook.c:471
+ NOTICE:  00000: ACORN-DBG: k=5, opening index
+ LOCATION:  acorn_begin_scan, acorn_hook.c:473

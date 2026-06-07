@@ -94,3 +94,154 @@ docker-shell: docker-build
 docker-clean:
 	docker compose -f docker/docker-compose.yml down -v 2>/dev/null || true
 	docker rmi $(DOCKER_IMAGE) 2>/dev/null || true
+
+# -----------------------------------------------------------------------
+# GCP VM remote targets — mirrors pg_cuvs gpu-* workflow
+#
+#   make vm-start              start GCP instance
+#   make vm-stop               stop GCP instance
+#   make vm-ip                 show current external IP
+#   make sync                  rsync local → VM
+#   make vm-build              build extension on VM
+#   make vm-install            install extension on VM
+#   make vm-test               regression + isolation on VM
+#   make vm-test-all           full ladder: unit → regress → isolation
+#   make vm-bench-cohere       Cohere 50M benchmark (async, nohup)
+#   make vm-bench-cohere-log   tail benchmark log
+#   make vm-bench-cohere-result pull result CSV
+#   make vm-bench-incremental  incremental insert recall harness (async)
+#   make vm-shell              interactive SSH session
+#   make vm-sql                ad-hoc SQL via stdin
+#   make vm-cycle              sync → build → install → test
+# -----------------------------------------------------------------------
+
+-include .env.vm
+export
+
+GCP_USER     ?= ubuntu
+VM_IP         = $(shell gcloud compute instances describe $(GCP_INSTANCE) \
+                    --zone $(GCP_ZONE) \
+                    $(if $(GCP_PROJECT),--project $(GCP_PROJECT)) \
+                    --format='value(networkInterfaces[0].accessConfigs[0].natIP)' \
+                    2>/dev/null)
+VM_HOST       = $(if $(VM_IP),$(GCP_USER)@$(VM_IP),$(GCP_VM))
+unexport VM_IP VM_HOST
+
+.PHONY: vm-start vm-stop vm-ip sync \
+	vm-build vm-install vm-test \
+	vm-test-unit vm-test-regress vm-test-isolation vm-test-all \
+	vm-bench-cohere vm-bench-cohere-log vm-bench-cohere-result \
+	vm-bench-incremental vm-bench-incremental-log vm-bench-incremental-result \
+	vm-shell vm-sql vm-cycle
+
+vm-start:
+	@test -n "$(GCP_INSTANCE)" || (echo "ERROR: set GCP_INSTANCE in .env.vm"; exit 1)
+	@test -n "$(GCP_PROJECT)"  || (echo "ERROR: set GCP_PROJECT in .env.vm";  exit 1)
+	gcloud compute instances start $(GCP_INSTANCE) --zone $(GCP_ZONE) --project $(GCP_PROJECT)
+	@echo "Waiting for SSH..."
+	@until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $(VM_HOST) true 2>/dev/null; \
+		do sleep 3; done
+	@echo "VM ready: $(VM_HOST)"
+
+vm-stop:
+	@test -n "$(GCP_PROJECT)" || (echo "ERROR: set GCP_PROJECT in .env.vm"; exit 1)
+	gcloud compute instances stop $(GCP_INSTANCE) --zone $(GCP_ZONE) --project $(GCP_PROJECT)
+
+vm-ip:
+	@gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) \
+		$(if $(GCP_PROJECT),--project $(GCP_PROJECT)) \
+		--format='value(status,networkInterfaces[0].accessConfigs[0].natIP)'
+
+# rsync local → VM. Excludes build artifacts so VM's compiled .o/.so stay intact.
+sync:
+	rsync -avz --delete \
+		--exclude '.git' \
+		--exclude 'src/*.o' \
+		--exclude 'src/*.bc' \
+		--exclude '*.so' \
+		--exclude '.env.vm' \
+		./ $(VM_HOST):~/pg_acorn/
+
+vm-build:
+	ssh -tt $(VM_HOST) "cd ~/pg_acorn && \
+		make PG_CONFIG=$(PG_CONFIG_REMOTE) 2>&1 | tee /tmp/pg_acorn_build.log"
+
+vm-install:
+	ssh -tt $(VM_HOST) "cd ~/pg_acorn && \
+		sudo make install PG_CONFIG=$(PG_CONFIG_REMOTE)"
+
+vm-test:
+	ssh -tt $(VM_HOST) "cd ~/pg_acorn && \
+		make installcheck PG_CONFIG=$(PG_CONFIG_REMOTE) PGUSER=postgres"
+
+vm-test-unit:
+	ssh -tt $(VM_HOST) "cd ~/pg_acorn && \
+		make unit"
+
+vm-test-regress:
+	ssh -tt $(VM_HOST) "cd ~/pg_acorn && \
+		make installcheck PG_CONFIG=$(PG_CONFIG_REMOTE) PGUSER=postgres"
+
+vm-test-isolation:
+	ssh -tt $(VM_HOST) "cd ~/pg_acorn && \
+		make installcheck-isolation PG_CONFIG=$(PG_CONFIG_REMOTE) PGUSER=postgres"
+
+vm-test-all: vm-test-unit vm-test-regress vm-test-isolation
+
+# Cohere 50M benchmark — runs async via nohup; poll with vm-bench-cohere-log.
+# N defaults to 5000000 (5M subset for iteration speed; override for full 35M).
+vm-bench-cohere:
+	@mkdir -p design/bench
+	@echo "[vm-bench-cohere] Launching Cohere benchmark (nohup, async)"
+	ssh $(VM_HOST) "cd ~/pg_acorn && \
+		nohup python3 bench/harness/cohere_bench.py \
+			--n $(if $(N),$(N),5000000) \
+			--scenarios $(if $(SCENARIOS),$(SCENARIOS),selectivity,range,multi) \
+			> /tmp/cohere_bench.log 2>&1 &"
+	@echo "Poll: make vm-bench-cohere-log"
+	@echo "Pull: make vm-bench-cohere-result"
+
+vm-bench-cohere-log:
+	ssh $(VM_HOST) "tail -60 /tmp/cohere_bench.log"
+
+vm-bench-cohere-result:
+	@mkdir -p design/bench
+	ssh $(VM_HOST) "cat ~/pg_acorn/bench/results/cohere_summary.jsonl 2>/dev/null \
+		|| echo 'Not ready — check: make vm-bench-cohere-log'"
+	rsync -avz $(VM_HOST):~/pg_acorn/bench/results/ design/bench/ 2>/dev/null || true
+
+# Incremental insert recall harness — inserts in rounds, measures recall@10 at
+# each checkpoint, asserts >= 0.85, writes design/bench/incremental.jsonl.
+vm-bench-incremental:
+	@mkdir -p design/bench
+	@echo "[vm-bench-incremental] Launching incremental harness (nohup, async)"
+	ssh $(VM_HOST) "cd ~/pg_acorn && \
+		nohup python3 bench/harness/incremental.py \
+			--initial $(if $(INITIAL),$(INITIAL),10000000) \
+			--batch   $(if $(BATCH),$(BATCH),5000000) \
+			--rounds  $(if $(ROUNDS),$(ROUNDS),5) \
+			--recall-floor 0.85 \
+			> /tmp/incremental_bench.log 2>&1 &"
+	@echo "Poll: make vm-bench-incremental-log"
+	@echo "Pull: make vm-bench-incremental-result"
+
+vm-bench-incremental-log:
+	ssh $(VM_HOST) "tail -60 /tmp/incremental_bench.log"
+
+vm-bench-incremental-result:
+	@mkdir -p design/bench
+	rsync -avz $(VM_HOST):~/pg_acorn/bench/results/incremental.jsonl design/bench/ 2>/dev/null || true
+	@cat design/bench/incremental.jsonl 2>/dev/null | python3 -c "\
+import sys, json; rows = [json.loads(l) for l in sys.stdin]; \
+[print(f\"round {r['round']:2d}  rows={r['total_rows']:>10,}  recall={r['recall_at_10']:.3f}  qps={r['qps']:.0f}\") for r in rows]" \
+	2>/dev/null || echo "(no results yet)"
+
+vm-shell:
+	ssh -tt $(VM_HOST)
+
+# Run ad-hoc SQL from stdin. Usage: make vm-sql < query.sql
+vm-sql:
+	ssh -o StrictHostKeyChecking=accept-new $(VM_HOST) \
+		"psql -d $(if $(DB),$(DB),postgres) -U postgres -P pager=off -A -F '|'"
+
+vm-cycle: sync vm-build vm-install vm-test

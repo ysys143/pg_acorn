@@ -1,6 +1,6 @@
 # using postmaster on Unix socket, default port
-ok 1         - smoke                                      35 ms
-not ok 2     - tier1_hook                                 78 ms
+ok 1         - smoke                                      89 ms
+not ok 2     - tier1_hook                               1393 ms
 # (test process exited with exit code 3)
 1..2
 # 1 of 2 tests failed.

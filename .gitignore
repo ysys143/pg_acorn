@@ -2,6 +2,7 @@
 .omc
 .venv
 .env
+.env.vm
 node_modules/
 __pycache__/
 *.pyc
