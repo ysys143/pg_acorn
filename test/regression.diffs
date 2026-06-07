@@ -1,12 +1,9 @@
 diff -U3 /workspace/test/expected/tier1_hook.out /workspace/test/results/tier1_hook.out
---- /workspace/test/expected/tier1_hook.out	2026-06-07 16:54:46.019465455 +0000
-+++ /workspace/test/results/tier1_hook.out	2026-06-07 16:54:46.200303073 +0000
-@@ -39,7 +39,7 @@
- LOCATION:  acorn_begin_scan, acorn_hook.c:480
- NOTICE:  00000: ACORN-DBG: reading indexoid, tag[0]=460
- LOCATION:  acorn_begin_scan, acorn_hook.c:488
--NOTICE:  00000: ACORN-DBG: indexoid=17064, reading k, tag[2]=460
-+NOTICE:  00000: ACORN-DBG: indexoid=17414, reading k, tag[2]=460
- LOCATION:  acorn_begin_scan, acorn_hook.c:490
- NOTICE:  00000: ACORN-DBG: k=5, opening index
- LOCATION:  acorn_begin_scan, acorn_hook.c:492
+--- /workspace/test/expected/tier1_hook.out	2026-06-07 16:57:37.655008207 +0000
++++ /workspace/test/results/tier1_hook.out	2026-06-07 16:57:38.033975758 +0000
+@@ -46,4 +46,4 @@
+     ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
+     LIMIT 5
+ ) sub;
+-ERROR:  different vector dimensions 16 and 4
++ERROR:  different vector dimensions 20 and 4

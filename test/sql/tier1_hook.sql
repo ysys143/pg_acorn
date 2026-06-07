@@ -26,13 +26,11 @@ FROM generate_series(1, 200) i;
 CREATE INDEX items_hnsw_idx ON items USING hnsw (embedding vector_cosine_ops);
 
 -- planner must choose Custom Scan (AcornScan), not Seq Scan
-\set VERBOSITY verbose
 EXPLAIN (COSTS OFF)
 SELECT id FROM items
 WHERE category = 'shoes'
 ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
 LIMIT 5;
-\set VERBOSITY default
 
 -- result must not be empty (at least 1 shoe exists)
 SELECT COUNT(*) >= 1 AS has_results

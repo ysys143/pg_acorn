@@ -465,30 +465,12 @@ acorn_begin_scan(CustomScanState *node, EState *estate, int eflags)
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	Oid		   indexoid;
 	int		   k;
-	elog(NOTICE, "ACORN-DBG: begin_scan entered, custom_private len=%d",
-		 list_length(cscan->custom_private));
-	/* Print plan tree structure to understand what ExecEndNode will traverse */
-	{
-		Plan *top   = estate->es_plannedstmt->planTree;
-		Plan *mid   = top  ? outerPlan(top)  : NULL;
-		Plan *bot   = mid  ? outerPlan(mid)  : NULL;
-		Plan *leaf  = bot  ? outerPlan(bot)  : NULL;
-		elog(NOTICE, "ACORN-DBG: plan-tree top=%d mid=%d bot=%d leaf=%d",
-			 top  ? (int) nodeTag(top)  : -1,
-			 mid  ? (int) nodeTag(mid)  : -1,
-			 bot  ? (int) nodeTag(bot)  : -1,
-			 leaf ? (int) nodeTag(leaf) : -1);
-	}
 
 	/* custom_private layout: [0]=indexoid, [1]=query_expr, [2]=k */
-	elog(NOTICE, "ACORN-DBG: reading indexoid, tag[0]=%d", (int)nodeTag(linitial(cscan->custom_private)));
 	indexoid = (Oid) intVal(linitial(cscan->custom_private));
-	elog(NOTICE, "ACORN-DBG: indexoid=%u, reading k, tag[2]=%d", indexoid, (int)nodeTag(lthird(cscan->custom_private)));
 	k        = (int) intVal(lthird(cscan->custom_private));
-	elog(NOTICE, "ACORN-DBG: k=%d, opening index", k);
 
 	acss->index  = index_open(indexoid, AccessShareLock);
-	elog(NOTICE, "ACORN-DBG: index opened");
 	acss->heap   = acss->css.ss.ss_currentRelation;
 	acss->k      = (k > 0) ? k : 100;
 	acss->ef_search = Max(acss->k * 4, 40);	/* heuristic default */
@@ -501,7 +483,6 @@ acorn_begin_scan(CustomScanState *node, EState *estate, int eflags)
 		acss->econtext  = CreateExprContext(estate);
 	}
 
-	elog(NOTICE, "ACORN-DBG: begin_scan done");
 	acss->query_evaluated = false;
 	acss->result_tids     = NULL;
 	acss->result_count    = 0;
@@ -578,7 +559,6 @@ static void
 acorn_end_scan(CustomScanState *node)
 {
 	AcornCustomScanState *acss = (AcornCustomScanState *) node;
-	elog(NOTICE, "ACORN-DBG: end_scan entered");
 
 	if (acss->index)
 	{
@@ -616,12 +596,9 @@ static void
 acorn_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	AcornCustomScanState *acss = (AcornCustomScanState *) node;
-	elog(NOTICE, "ACORN-DBG: explain_scan entered");
 	ExplainPropertyText("ACORN mode", "ACORN-1 predicate subgraph traversal", es);
-	elog(NOTICE, "ACORN-DBG: after PropertyText");
 	ExplainPropertyInteger("k", NULL, acss->k, es);
 	ExplainPropertyInteger("ef_search", NULL, acss->ef_search, es);
-	elog(NOTICE, "ACORN-DBG: explain_scan done");
 }
 
 /* -----------------------------------------------------------------------

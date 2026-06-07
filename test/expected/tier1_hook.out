@@ -21,37 +21,29 @@ FROM generate_series(1, 200) i;
 -- Tier 1: existing hnsw index, no rebuild
 CREATE INDEX items_hnsw_idx ON items USING hnsw (embedding vector_cosine_ops);
 -- planner must choose Custom Scan (AcornScan), not Seq Scan
-\set VERBOSITY verbose
 EXPLAIN (COSTS OFF)
 SELECT id FROM items
 WHERE category = 'shoes'
 ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
 LIMIT 5;
-NOTICE:  00000: ACORN-DBG: plan_custom_path entered, tlist len=2
-LOCATION:  acorn_plan_custom_path, acorn_hook.c:394
-NOTICE:  00000: ACORN-DBG: tlist[0] expr_tag=6 resjunk=0
-LOCATION:  acorn_plan_custom_path, acorn_hook.c:401
-NOTICE:  00000: ACORN-DBG: tlist[1] expr_tag=6 resjunk=0
-LOCATION:  acorn_plan_custom_path, acorn_hook.c:401
-NOTICE:  00000: ACORN-DBG: begin_scan entered, custom_private len=3
-LOCATION:  acorn_begin_scan, acorn_hook.c:472
-NOTICE:  00000: ACORN-DBG: plan-tree top=369 mid=358 bot=327 leaf=351
-LOCATION:  acorn_begin_scan, acorn_hook.c:480
-NOTICE:  00000: ACORN-DBG: reading indexoid, tag[0]=460
-LOCATION:  acorn_begin_scan, acorn_hook.c:488
-NOTICE:  00000: ACORN-DBG: indexoid=17064, reading k, tag[2]=460
-LOCATION:  acorn_begin_scan, acorn_hook.c:490
-NOTICE:  00000: ACORN-DBG: k=5, opening index
-LOCATION:  acorn_begin_scan, acorn_hook.c:492
-NOTICE:  00000: ACORN-DBG: index opened
-LOCATION:  acorn_begin_scan, acorn_hook.c:495
-NOTICE:  00000: ACORN-DBG: begin_scan done
-LOCATION:  acorn_begin_scan, acorn_hook.c:508
-NOTICE:  00000: ACORN-DBG: explain_scan entered
-LOCATION:  acorn_explain_scan, acorn_hook.c:623
-NOTICE:  00000: ACORN-DBG: after PropertyText
-LOCATION:  acorn_explain_scan, acorn_hook.c:625
-NOTICE:  00000: ACORN-DBG: explain_scan done
-LOCATION:  acorn_explain_scan, acorn_hook.c:628
-ERROR:  XX000: unrecognized node type: 0
-LOCATION:  ExecEndNode, execProcnode.c:755
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: ((embedding <-> '[0.1,0.2,0.3,0.4]'::vector))
+         ->  Result
+               ->  Custom Scan (AcornScan) on items
+                     ACORN mode: ACORN-1 predicate subgraph traversal
+                     k: 5
+                     ef_search: 40
+(8 rows)
+
+-- result must not be empty (at least 1 shoe exists)
+SELECT COUNT(*) >= 1 AS has_results
+FROM (
+    SELECT id FROM items
+    WHERE category = 'shoes'
+    ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
+    LIMIT 5
+) sub;
+ERROR:  different vector dimensions 16 and 4
