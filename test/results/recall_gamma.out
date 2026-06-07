@@ -2,16 +2,24 @@
 -- TDD: golden file starts empty; populate after implementation passes
 \set ON_ERROR_STOP on
 CREATE SCHEMA test_recall_gamma;
-SET search_path = test_recall_gamma, public;
 CREATE EXTENSION IF NOT EXISTS vector;
 NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_acorn;
 NOTICE:  extension "pg_acorn" already exists, skipping
+SET search_path = test_recall_gamma, public;
 CREATE TABLE items (
     id        serial PRIMARY KEY,
     bucket    int,
     embedding vector(8)
 );
-ERROR:  type "vector" does not exist
-LINE 4:     embedding vector(8)
-                      ^
+INSERT INTO items (bucket, embedding) SELECT
+    (i % 100),
+    ('[' || array_to_string(ARRAY(
+        SELECT round(random()::numeric, 4)
+        FROM generate_series(1,8)
+    ), ',') || ']')::vector
+FROM generate_series(1, 2000) i;
+CREATE INDEX g1_idx ON items USING acorn_hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64, acorn_gamma = 1);
+ERROR:  acorn_hnsw index AM not yet implemented
+HINT:  Step 3 will implement the full acorn_hnsw AM.
