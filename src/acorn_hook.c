@@ -391,18 +391,6 @@ acorn_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 					   List *tlist, List *clauses, List *custom_plans)
 {
 	CustomScan *cscan = makeNode(CustomScan);
-	elog(NOTICE, "ACORN-DBG: plan_custom_path entered, tlist len=%d", list_length(tlist));
-	{
-		ListCell *lc2;
-		int i = 0;
-		foreach(lc2, tlist)
-		{
-			TargetEntry *te = (TargetEntry *) lfirst(lc2);
-			elog(NOTICE, "ACORN-DBG: tlist[%d] expr_tag=%d resjunk=%d",
-				 i, (int) nodeTag(te->expr), te->resjunk);
-			i++;
-		}
-	}
 
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual		= NIL;	/* quals evaluated inside executor */
@@ -458,6 +446,14 @@ static Node *
 acorn_create_scan_state(CustomScan *cscan)
 {
 	AcornCustomScanState *acss = palloc0(sizeof(AcornCustomScanState));
+	/*
+	 * Must set the node tag explicitly.  ExecEndNode (and other executor
+	 * teardown) dispatch on nodeTag(planstate); a bare palloc0 leaves type =
+	 * T_Invalid (0), which survives ExecInitCustomScan's castNode() in
+	 * non-assert builds but crashes ExecEndNode with "unrecognized node
+	 * type: 0".  newNode/NodeSetTag is the canonical idiom here.
+	 */
+	NodeSetTag(acss, T_CustomScanState);
 	acss->css.methods = &acorn_exec_methods;
 	return (Node *) acss;
 }
