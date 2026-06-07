@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_bench:
+        description: "Run benchmarks (slow)"
+        type: boolean
+        default: false
+
+jobs:
+  unit:
+    name: Unit tests (no PostgreSQL)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run unit tests
+        run: make unit
+
+  regression:
+    name: Regression + isolation tests
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: make docker-build
+
+      - name: Run full test suite
+        run: make docker-test
+
+      - name: Upload regression diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-diffs
+          path: test/regression.diffs
+
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'workflow_dispatch' && inputs.run_bench
+    needs: regression
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: make docker-build
+
+      - name: Run benchmarks (all scenarios)
+        run: make docker-bench
+
+      - name: Upload bench results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench/results.json

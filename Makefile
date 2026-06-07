@@ -50,3 +50,49 @@ unit:
 .PHONY: bench
 bench:
 	python3 bench/run_bench.py $(BENCH_ARGS)
+
+# -----------------------------------------------------------------------
+# Docker targets — mirrors pg_cuvs VM-based workflow
+#
+#   make docker-build   build test image (PG17 + pgvector 0.8.0)
+#   make docker-test    regression + isolation tests inside container
+#   make docker-unit    standalone C unit tests (no PG needed)
+#   make docker-bench   compose up: postgres + qdrant, then run_bench.py
+#   make docker-shell   interactive bash session in container
+#   make docker-clean   remove containers and image
+# -----------------------------------------------------------------------
+
+DOCKER_IMAGE   = pg_acorn_test
+DOCKER_RUN     = docker run --rm \
+    -v $(CURDIR):/workspace \
+    -e WORKSPACE=/workspace \
+    -w /workspace \
+    $(DOCKER_IMAGE)
+
+.PHONY: docker-build docker-test docker-unit docker-bench docker-shell docker-clean
+
+docker-build:
+	docker build -f docker/Dockerfile -t $(DOCKER_IMAGE) .
+
+docker-test: docker-build
+	$(DOCKER_RUN) bash -c "\
+	    make -C /workspace PG_CONFIG=\$$PG_CONFIG \
+	    && /usr/local/bin/init-test.sh"
+
+docker-unit:
+	$(DOCKER_RUN) make -C /workspace unit
+
+docker-bench: docker-build
+	BENCH_SCENARIO=$(BENCH_SCENARIO) \
+	docker compose -f docker/docker-compose.yml \
+	    --profile bench run --rm bench
+
+docker-shell: docker-build
+	docker run --rm -it \
+	    -v $(CURDIR):/workspace \
+	    -w /workspace \
+	    $(DOCKER_IMAGE) bash
+
+docker-clean:
+	docker compose -f docker/docker-compose.yml down -v 2>/dev/null || true
+	docker rmi $(DOCKER_IMAGE) 2>/dev/null || true
