@@ -24,13 +24,15 @@ typedef struct AcornScanState
 } AcornScanState;
 
 /*
- * Execute ACORN-1 traversal starting from entry_element.
- * Returns up to k element ids in result_ids (caller-allocated, size k).
+ * Execute ACORN-1 traversal.
+ * result_tids_out must be caller-allocated with at least state->k slots.
  * Returns actual count (may be < k if graph has fewer matching nodes).
  */
 int acorn_scan_execute(AcornScanState *state,
 					   Relation index,
+					   Relation heap,
 					   Datum query_vec,
-					   int64 *result_ids);
+					   Snapshot snapshot,
+					   ItemPointerData *result_tids_out);
 
 #endif /* ACORN_SCAN_H */

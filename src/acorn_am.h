@@ -1,18 +1,15 @@
 #ifndef ACORN_AM_H
 #define ACORN_AM_H
 
-#include "postgres.h"
-
 /*
  * Tier 2: acorn_hnsw index Access Method
  *
  * Full IndexAmRoutine registration.  Build stores M*gamma neighbors per node
  * (controlled by the acorn_gamma reloption).  Scan delegates to acorn_scan.c.
+ *
+ * The handler function (acorn_hnsw_handler) is declared via PG_FUNCTION_INFO_V1
+ * in acorn_am.c and registered through SQL only — no C-level declaration needed.
  */
-
-/* Entry point registered in pg_acorn--0.1.0.sql */
-Datum acorn_hnsw_handler(PG_FUNCTION_ARGS);
-PG_FUNCTION_INFO_V1(acorn_hnsw_handler);
 
 /* reloption defaults */
 #define ACORN_DEFAULT_M              16

@@ -35,16 +35,15 @@ src/pg_acorn.o:   src/acorn_hook.h src/acorn_am.h
 src/acorn_hook.o: src/acorn_hook.h src/acorn_scan.h
 src/acorn_am.o:   src/acorn_am.h   src/acorn_scan.h src/acorn_cost.h
 src/acorn_build.o: src/acorn_am.h
-src/acorn_scan.o:  src/acorn_scan.h
+src/acorn_scan.o:  src/acorn_scan.h src/hnsw_compat.h
 src/acorn_cost.o:  src/acorn_cost.h
 
-# Unit tests (built and run independently of PGXS)
+# Unit tests — standalone C binaries, no PostgreSQL dependency.
+# Tests cover algorithm logic extracted in test/unit/*.c (self-contained stubs).
 .PHONY: unit
 unit:
-	$(CC) $(CFLAGS) -Isrc -o test/unit/test_acorn_scan \
-		test/unit/test_acorn_scan.c src/acorn_scan.c
-	$(CC) $(CFLAGS) -Isrc -o test/unit/test_acorn_build \
-		test/unit/test_acorn_build.c src/acorn_build.c
+	$(CC) $(CFLAGS) -o test/unit/test_acorn_scan test/unit/test_acorn_scan.c
+	$(CC) $(CFLAGS) -o test/unit/test_acorn_build test/unit/test_acorn_build.c
 	test/unit/test_acorn_scan
 	test/unit/test_acorn_build
 
