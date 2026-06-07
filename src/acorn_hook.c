@@ -393,7 +393,15 @@ acorn_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 	CustomScan *cscan = makeNode(CustomScan);
 
 	cscan->scan.plan.targetlist = tlist;
-	cscan->scan.plan.qual		= NIL;	/* quals evaluated inside executor */
+	/*
+	 * clauses is the relation's baserestrictinfo extracted to bare Expr nodes
+	 * (the WHERE filter, e.g. category = 'shoes').  We store it as the plan
+	 * qual so acorn_begin_scan can build the ACORN predicate ExprState from it.
+	 * Our ExecCustomScan applies this predicate during traversal (ACORN-1:
+	 * filter-failing nodes are excluded from results but kept as candidates),
+	 * so we never rely on ExecScan's qual machinery.
+	 */
+	cscan->scan.plan.qual		= clauses;
 	cscan->scan.scanrelid		= best_path->path.parent->relid;
 	cscan->flags				= 0;
 	cscan->custom_plans			= NIL;
@@ -422,18 +430,6 @@ acorn_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	cscan->custom_scan_tlist	= NIL;
 	cscan->methods				= &acorn_scan_methods;
-
-	/*
-	 * Keep scan.plan.qual = NIL.  Pushing the WHERE clause into the plan qual
-	 * causes set_customscan_references → fix_scan_list → expression_tree_mutator
-	 * to walk the predicate expressions.  If any node in those expressions has
-	 * an unrecognized tag (e.g. from pgvector internals or unfolded casts) that
-	 * walk aborts with "unrecognized node type: 0".
-	 *
-	 * Predicate evaluation is handled directly inside acorn_scan_execute via
-	 * the AcornScanState.predicate field, which is initialised from
-	 * rel->baserestrictinfo in acorn_begin_scan below.
-	 */
 
 	return (Plan *) cscan;
 }
@@ -517,8 +513,9 @@ static TupleTableSlot *
 acorn_exec_scan(CustomScanState *node)
 {
 	AcornCustomScanState *acss = (AcornCustomScanState *) node;
-	EState		 *estate = node->ss.ps.state;
-	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	EState		   *estate   = node->ss.ps.state;
+	TupleTableSlot *scanslot = node->ss.ss_ScanTupleSlot;
+	ExprContext	   *econtext = node->ss.ps.ps_ExprContext;
 
 	/* On first call: run ACORN-1 traversal and cache all results */
 	if (!acss->query_evaluated)
@@ -545,22 +542,33 @@ acorn_exec_scan(CustomScanState *node)
 		acss->result_pos = 0;
 	}
 
-	/* Return next cached result */
-	if (acss->result_pos >= acss->result_count)
-		return ExecClearTuple(slot);
-
+	/* Fetch the next cached result tuple, skipping any since-deleted rows */
+	while (acss->result_pos < acss->result_count)
 	{
 		ItemPointer tid = &acss->result_tids[acss->result_pos++];
-		bool		found;
 
-		ExecClearTuple(slot);
-		found = table_tuple_fetch_row_version(acss->heap, tid,
-										  GetActiveSnapshot(), slot);
-		if (!found)
-			return acorn_exec_scan(node);	/* skip deleted rows */
+		ExecClearTuple(scanslot);
+		if (!table_tuple_fetch_row_version(acss->heap, tid,
+										   GetActiveSnapshot(), scanslot))
+			continue;	/* row vanished — try the next one */
+
+		/*
+		 * Apply the node's projection so the output slot matches the declared
+		 * targetlist (column order/types).  When no projection is needed
+		 * ps_ProjInfo is NULL and the raw scan slot is returned directly.
+		 */
+		if (node->ss.ps.ps_ProjInfo)
+		{
+			econtext->ecxt_scantuple = scanslot;
+			return ExecProject(node->ss.ps.ps_ProjInfo);
+		}
+		return scanslot;
 	}
 
-	return slot;
+	/* Exhausted: return an empty slot of the correct (result) type */
+	if (node->ss.ps.ps_ResultTupleSlot)
+		return ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	return ExecClearTuple(scanslot);
 }
 
 static void

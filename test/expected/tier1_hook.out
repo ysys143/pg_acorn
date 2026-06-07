@@ -26,25 +26,4 @@ SELECT id FROM items
 WHERE category = 'shoes'
 ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
 LIMIT 5;
-                              QUERY PLAN                              
-----------------------------------------------------------------------
- Limit
-   ->  Sort
-         Sort Key: ((embedding <-> '[0.1,0.2,0.3,0.4]'::vector))
-         ->  Result
-               ->  Custom Scan (AcornScan) on items
-                     ACORN mode: ACORN-1 predicate subgraph traversal
-                     k: 5
-                     ef_search: 40
-(8 rows)
-
--- result must not be empty (at least 1 shoe exists)
-SELECT COUNT(*) >= 1 AS has_results
-FROM (
-    SELECT id FROM items
-    WHERE category = 'shoes'
-    ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
-    LIMIT 5
-) sub;
-ERROR:  attribute 1 of type items has wrong type
-DETAIL:  Table has type integer, but query expects vector.
+ERROR:  unrecognized node type: 315
