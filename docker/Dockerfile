@@ -20,7 +20,7 @@ RUN git clone --depth 1 --branch v0.8.0 \
 
 # Python bench dependencies (optional — only needed for docker-bench)
 COPY bench/requirements.txt /tmp/bench-requirements.txt
-RUN pip3 install --no-cache-dir -r /tmp/bench-requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/bench-requirements.txt
 
 # pg_acorn source is volume-mounted at /workspace at runtime.
 # The image contains only the toolchain; no source copy here.
