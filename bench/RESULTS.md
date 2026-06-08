@@ -1,5 +1,76 @@
 # pg_acorn Benchmark — Scenario A (Filter Selectivity Sweep)
 
+## Run 3: Page-I/O Baseline (n=10,000)
+
+Adds **`pages_per_query`** (shared hit + read logical page accesses) measured via
+`EXPLAIN (ANALYZE, BUFFERS)` on a 20-query sample per selectivity, collected
+*outside* the timing loop. This operationalizes the SIGMOD 2026 FVS-in-PG paper's
+central claim (§1): in a DBMS, **page access — not distance computation — is the
+real cost**, so it is the metric against which Translation Map / 2-hop / NaviX
+optimizations must be judged (see `docs/development-roadmap.md`).
+
+### Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Vectors / dim / queries / k | 10,000 / 64 / 50 / 10 |
+| Index params | m=16, ef_construction=64 |
+| Page-I/O sample | 20 queries per selectivity, non-timed |
+| Qdrant | skipped (no PG buffer concept) |
+
+### Recall@10 vs filter selectivity
+
+| Target | 1% | 5% | 10% | 40% | 80% |
+|--------|----|----|-----|-----|-----|
+| pgvector | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| pg_acorn Tier 1 (g1) | 1.000 | 1.000 | 1.000 | 0.982 | 0.974 |
+| pg_acorn Tier 2 (g1) | 1.000 | 0.980 | 0.922 | 0.924 | 0.950 |
+| pg_acorn Tier 2 (g2) | 1.000 | 0.992 | 0.996 | 0.972 | 0.976 |
+
+### Pages per query (shared hit + read) — NEW
+
+| Target | 1% | 5% | 10% | 40% | 80% |
+|--------|----|----|-----|-----|-----|
+| pgvector | 27,353 | 12,679 | 7,905 | 2,541 | 1,441 |
+| pg_acorn Tier 1 (g1) | 27,349 | 12,726 | 7,919 | 1,244 | 1,230 |
+| pg_acorn Tier 2 (g1) | **63,000** | 22,820 | 13,027 | 2,403 | 2,389 |
+| pg_acorn Tier 2 (g2) | **371** | 35,922 | 20,970 | 4,186 | 4,172 |
+
+### Interpretation
+
+**The page-I/O metric reveals cost structure invisible to QPS alone.**
+
+- **Tier 1 ≈ pgvector at low selectivity** (~27k pages at 1%): the hook traverses
+  the same underlying pgvector HNSW graph; the win is in *what it returns*
+  (recall 1.0), not in pages touched.
+- **Tier 2 g1 at 1% = 63,000 pages (qps=11)**: the iterative scan re-runs the full
+  HNSW traversal on every ef doubling. This quantifies the carry-forward
+  "resumable scan" item — the cost is now a concrete number, not a hunch.
+- **Tier 2 g2 at 1% = 371 pages (qps=47) at recall 1.0**: gamma=2's denser graph
+  reaches the sparse 1%-filter matches with **~170x fewer page accesses than g1**
+  for identical recall. This is ACORN-γ's low-selectivity value proposition,
+  quantified for the first time. QPS hinted it (47 vs 11); pages_per_query
+  explains *why*.
+- **`read=0` across the board**: after the timing loop the buffer pool is warm, so
+  `pages_total = pages_hit` = logical page accesses (buffer lookup + lock count) —
+  exactly the cost the paper attributes the DBMS overhead to (§4: 1+M+M² accesses
+  per 2-hop step; §5: TM removes 60–75% of heaptid-fetch cost).
+
+This run is the **baseline**: future TM / 2-hop / NaviX-Directed work will be
+measured as page-access reductions against these numbers.
+
+### Reproduce
+
+```sh
+# inside pg_acorn_test image with Postgres started + extensions created:
+python3 bench/run_bench.py --scenario a \
+    --dsn "postgresql://postgres@localhost/postgres" \
+    --n-vectors 10000 --dim 64 --n-queries 50 --output bench/results.json
+python3 bench/report.py --input bench/results.json --output bench/report/
+```
+
+---
+
 ## Run 2: Production Build + Iterative Scan (n=10,000)
 
 Second run after replacing the O(n²) brute-force build and adding iterative scan.

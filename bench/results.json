@@ -2,34 +2,49 @@
   "pgvector": {
     "a": {
       "1": {
-        "recall_mean": 0.04,
-        "recall_min": 0.0,
-        "qps": 1284.6832791308518,
-        "p99_ms": 7.795584679115551
+        "recall_mean": 1.0,
+        "recall_min": 1.0,
+        "qps": 22.52887627474732,
+        "p99_ms": 266.3602995313704,
+        "pages_total_mean": 27353.3,
+        "pages_hit_mean": 27353.3,
+        "pages_read_mean": 0.0
       },
       "5": {
-        "recall_mean": 0.20400000000000001,
-        "recall_min": 0.0,
-        "qps": 123.4547721049132,
-        "p99_ms": 274.05757164582565
+        "recall_mean": 1.0,
+        "recall_min": 1.0,
+        "qps": 79.84614031689564,
+        "p99_ms": 232.45440561091522,
+        "pages_total_mean": 12679.4,
+        "pages_hit_mean": 12679.4,
+        "pages_read_mean": 0.0
       },
       "10": {
-        "recall_mean": 0.40800000000000003,
-        "recall_min": 0.0,
-        "qps": 1408.763002610471,
-        "p99_ms": 5.880473488941781
+        "recall_mean": 1.0,
+        "recall_min": 1.0,
+        "qps": 87.32122587267592,
+        "p99_ms": 328.3615184586956,
+        "pages_total_mean": 7904.9,
+        "pages_hit_mean": 7904.9,
+        "pages_read_mean": 0.0
       },
       "40": {
-        "recall_mean": 0.9560000000000001,
-        "recall_min": 0.9,
-        "qps": 423.60312909837916,
-        "p99_ms": 84.81772485887609
+        "recall_mean": 1.0,
+        "recall_min": 1.0,
+        "qps": 194.68906956721108,
+        "p99_ms": 73.40723820496346,
+        "pages_total_mean": 2541.2,
+        "pages_hit_mean": 2541.2,
+        "pages_read_mean": 0.0
       },
       "80": {
-        "recall_mean": 0.972,
-        "recall_min": 0.8,
-        "qps": 425.50185206143874,
-        "p99_ms": 89.08160834456764
+        "recall_mean": 1.0,
+        "recall_min": 1.0,
+        "qps": 413.61157084820627,
+        "p99_ms": 66.19486656039945,
+        "pages_total_mean": 1440.55,
+        "pages_hit_mean": 1440.55,
+        "pages_read_mean": 0.0
       }
     }
   },
@@ -38,32 +53,47 @@
       "1": {
         "recall_mean": 1.0,
         "recall_min": 1.0,
-        "qps": 1656.596921952369,
-        "p99_ms": 2.864631542470304
+        "qps": 28.34337610807664,
+        "p99_ms": 272.1660194010473,
+        "pages_total_mean": 27348.75,
+        "pages_hit_mean": 27348.75,
+        "pages_read_mean": 0.0
       },
       "5": {
-        "recall_mean": 0.206,
-        "recall_min": 0.0,
-        "qps": 282.52357725964146,
-        "p99_ms": 91.47703559836364
+        "recall_mean": 1.0,
+        "recall_min": 1.0,
+        "qps": 124.19509118880026,
+        "p99_ms": 251.46818192908538,
+        "pages_total_mean": 12726.2,
+        "pages_hit_mean": 12726.2,
+        "pages_read_mean": 0.0
       },
       "10": {
-        "recall_mean": 0.408,
-        "recall_min": 0.0,
-        "qps": 816.2583752203531,
-        "p99_ms": 11.489122584462141
+        "recall_mean": 1.0,
+        "recall_min": 1.0,
+        "qps": 105.89297186744206,
+        "p99_ms": 254.98461789684362,
+        "pages_total_mean": 7919.35,
+        "pages_hit_mean": 7919.35,
+        "pages_read_mean": 0.0
       },
       "40": {
-        "recall_mean": 0.9499999999999998,
-        "recall_min": 0.8,
-        "qps": 383.53611290574736,
-        "p99_ms": 100.8526719536164
+        "recall_mean": 0.982,
+        "recall_min": 0.9,
+        "qps": 282.18593295172417,
+        "p99_ms": 138.53759773424795,
+        "pages_total_mean": 1244.15,
+        "pages_hit_mean": 1244.15,
+        "pages_read_mean": 0.0
       },
       "80": {
-        "recall_mean": 0.97,
+        "recall_mean": 0.9740000000000001,
         "recall_min": 0.8,
-        "qps": 404.1455811651052,
-        "p99_ms": 64.00930337840677
+        "qps": 450.3146001959371,
+        "p99_ms": 66.67213845998025,
+        "pages_total_mean": 1230.4,
+        "pages_hit_mean": 1230.4,
+        "pages_read_mean": 0.0
       }
     }
   },
@@ -72,32 +102,47 @@
       "1": {
         "recall_mean": 1.0,
         "recall_min": 1.0,
-        "qps": 12.454373941150923,
-        "p99_ms": 442.08526078029536
+        "qps": 11.330092560654805,
+        "p99_ms": 362.23509490839206,
+        "pages_total_mean": 63000.0,
+        "pages_hit_mean": 63000.0,
+        "pages_read_mean": 0.0
       },
       "5": {
-        "recall_mean": 0.9739999999999999,
-        "recall_min": 0.8,
-        "qps": 33.20833397536601,
-        "p99_ms": 273.58987010898994
+        "recall_mean": 0.98,
+        "recall_min": 0.9,
+        "qps": 45.436014003595744,
+        "p99_ms": 342.4318985047283,
+        "pages_total_mean": 22819.55,
+        "pages_hit_mean": 22819.55,
+        "pages_read_mean": 0.0
       },
       "10": {
-        "recall_mean": 0.9180000000000001,
+        "recall_mean": 0.9219999999999999,
         "recall_min": 0.6,
-        "qps": 132.78803943082278,
-        "p99_ms": 171.59291563555584
+        "qps": 81.99389782772536,
+        "p99_ms": 233.2430174842011,
+        "pages_total_mean": 13027.4,
+        "pages_hit_mean": 13027.4,
+        "pages_read_mean": 0.0
       },
       "40": {
-        "recall_mean": 0.9359999999999999,
-        "recall_min": 0.7,
-        "qps": 133.75502985220896,
-        "p99_ms": 204.29029105929624
+        "recall_mean": 0.9239999999999999,
+        "recall_min": 0.8,
+        "qps": 255.05254073354448,
+        "p99_ms": 153.60236542997825,
+        "pages_total_mean": 2403.05,
+        "pages_hit_mean": 2403.05,
+        "pages_read_mean": 0.0
       },
       "80": {
-        "recall_mean": 0.95,
+        "recall_mean": 0.9499999999999998,
         "recall_min": 0.8,
-        "qps": 448.8589435163179,
-        "p99_ms": 22.914342691656156
+        "qps": 312.27234555116576,
+        "p99_ms": 105.7648921606593,
+        "pages_total_mean": 2388.9,
+        "pages_hit_mean": 2388.9,
+        "pages_read_mean": 0.0
       }
     }
   },
@@ -106,32 +151,47 @@
       "1": {
         "recall_mean": 1.0,
         "recall_min": 1.0,
-        "qps": 927.4192730006233,
-        "p99_ms": 13.508361444110013
+        "qps": 46.87196146103723,
+        "p99_ms": 342.2691541642415,
+        "pages_total_mean": 371.0,
+        "pages_hit_mean": 371.0,
+        "pages_read_mean": 0.0
       },
       "5": {
         "recall_mean": 0.992,
         "recall_min": 0.9,
-        "qps": 19.21955320109939,
-        "p99_ms": 533.4836101450487
+        "qps": 27.821811617304405,
+        "p99_ms": 415.7886402111033,
+        "pages_total_mean": 35922.0,
+        "pages_hit_mean": 35922.0,
+        "pages_read_mean": 0.0
       },
       "10": {
-        "recall_mean": 0.992,
+        "recall_mean": 0.996,
         "recall_min": 0.9,
-        "qps": 26.519925637559815,
-        "p99_ms": 541.4396026881874
+        "qps": 73.46443542867868,
+        "p99_ms": 271.16028412827245,
+        "pages_total_mean": 20969.5,
+        "pages_hit_mean": 20969.5,
+        "pages_read_mean": 0.0
       },
       "40": {
-        "recall_mean": 0.9660000000000001,
+        "recall_mean": 0.9719999999999999,
         "recall_min": 0.8,
-        "qps": 88.14919999765507,
-        "p99_ms": 239.33282004320057
+        "qps": 177.3556564472695,
+        "p99_ms": 230.0674430630161,
+        "pages_total_mean": 4185.55,
+        "pages_hit_mean": 4185.55,
+        "pages_read_mean": 0.0
       },
       "80": {
-        "recall_mean": 0.97,
-        "recall_min": 0.9,
-        "qps": 69.94762049243326,
-        "p99_ms": 231.65774716995645
+        "recall_mean": 0.9760000000000001,
+        "recall_min": 0.8,
+        "qps": 291.421736222917,
+        "p99_ms": 118.4098954882934,
+        "pages_total_mean": 4171.8,
+        "pages_hit_mean": 4171.8,
+        "pages_read_mean": 0.0
       }
     }
   }
