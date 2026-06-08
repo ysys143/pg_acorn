@@ -78,6 +78,8 @@ def main() -> None:
         PgAcornTarget(args.dsn, tier=1, gamma=1),
         PgAcornTarget(args.dsn, tier=2, gamma=1),
         PgAcornTarget(args.dsn, tier=2, gamma=2),
+        PgAcornTarget(args.dsn, tier=2, gamma=1, enable_2hop=True),
+        PgAcornTarget(args.dsn, tier=2, gamma=2, enable_2hop=True),
     ]
     if args.qdrant:
         targets.append(QdrantTarget(args.qdrant))

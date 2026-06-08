@@ -8,11 +8,14 @@ from ._bulk import copy_load as _copy_load
 
 
 class PgAcornTarget:
-    def __init__(self, dsn: str, tier: int = 2, gamma: int = 1):
+    def __init__(self, dsn: str, tier: int = 2, gamma: int = 1,
+                 enable_2hop: bool = False):
         assert tier in (1, 2), "tier must be 1 or 2"
         self.tier = tier
         self.gamma = gamma
-        self.name = f"pg_acorn_tier{tier}_g{gamma}"
+        self.enable_2hop = enable_2hop
+        suffix = "_2hop" if enable_2hop else ""
+        self.name = f"pg_acorn_tier{tier}_g{gamma}{suffix}"
         self.conn = psycopg.connect(dsn, autocommit=True)
 
     def setup(self, vectors: np.ndarray, metadata: list[dict]) -> None:
@@ -45,6 +48,9 @@ class PgAcornTarget:
                     USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
                     WITH (m = 16, ef_construction = 64, acorn_gamma = {self.gamma})
                 """)
+                cur.execute(
+                    f"SET pg_acorn.enable_2hop = {'on' if self.enable_2hop else 'off'}"
+                )
 
     def query_filtered(self, query: np.ndarray, bucket_threshold: int, k: int) -> list[int]:
         with self.conn.cursor() as cur:
