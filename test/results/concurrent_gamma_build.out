@@ -1,5 +1,77 @@
 Parsed test spec with 2 sessions
 
 starting permutation: read write
-setup failed: ERROR:  acorn_hnsw index AM not yet implemented
-HINT:  Step 3 will implement the full acorn_hnsw AM.
+step read: 
+    SELECT count(*) FROM (
+        SELECT id FROM build_items
+        WHERE bucket < 2
+        ORDER BY embedding <-> '[0.5,0.0,0.0,0.0]'
+        LIMIT 5
+    ) sub;
+
+count
+-----
+    5
+(1 row)
+
+step write: 
+    INSERT INTO build_items (bucket, embedding)
+    VALUES (1, '[0.51,0.0,0.0,0.0]'),
+           (2, '[0.52,0.0,0.0,0.0]'),
+           (3, '[0.53,0.0,0.0,0.0]');
+
+
+starting permutation: write read
+step write: 
+    INSERT INTO build_items (bucket, embedding)
+    VALUES (1, '[0.51,0.0,0.0,0.0]'),
+           (2, '[0.52,0.0,0.0,0.0]'),
+           (3, '[0.53,0.0,0.0,0.0]');
+
+step read: 
+    SELECT count(*) FROM (
+        SELECT id FROM build_items
+        WHERE bucket < 2
+        ORDER BY embedding <-> '[0.5,0.0,0.0,0.0]'
+        LIMIT 5
+    ) sub;
+
+count
+-----
+    5
+(1 row)
+
+
+starting permutation: read write read
+step read: 
+    SELECT count(*) FROM (
+        SELECT id FROM build_items
+        WHERE bucket < 2
+        ORDER BY embedding <-> '[0.5,0.0,0.0,0.0]'
+        LIMIT 5
+    ) sub;
+
+count
+-----
+    5
+(1 row)
+
+step write: 
+    INSERT INTO build_items (bucket, embedding)
+    VALUES (1, '[0.51,0.0,0.0,0.0]'),
+           (2, '[0.52,0.0,0.0,0.0]'),
+           (3, '[0.53,0.0,0.0,0.0]');
+
+step read: 
+    SELECT count(*) FROM (
+        SELECT id FROM build_items
+        WHERE bucket < 2
+        ORDER BY embedding <-> '[0.5,0.0,0.0,0.0]'
+        LIMIT 5
+    ) sub;
+
+count
+-----
+    5
+(1 row)
+

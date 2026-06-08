@@ -30,10 +30,12 @@ teardown
 
 session "reader"
 step "read"  {
-    SELECT count(*) FROM build_items
-    WHERE bucket < 2
-    ORDER BY embedding <-> '[0.5,0.0,0.0,0.0]'
-    LIMIT 5;
+    SELECT count(*) FROM (
+        SELECT id FROM build_items
+        WHERE bucket < 2
+        ORDER BY embedding <-> '[0.5,0.0,0.0,0.0]'
+        LIMIT 5
+    ) sub;
 }
 
 session "writer"

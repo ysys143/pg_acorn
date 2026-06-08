@@ -13,15 +13,17 @@ OBJS = \
 
 REGRESS = \
 	smoke \
-	tier1_hook
-# Step 3 tests (acorn_hnsw AM required — re-enable after implementing acorn_build.c):
-# tier2_am recall_filter recall_gamma recall_insert no_regression
+	tier1_hook \
+	tier2_am \
+	no_regression \
+	recall_filter \
+	recall_gamma \
+	recall_insert
 
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
-# Step 3 isolation tests (acorn_hnsw AM required):
-# ISOLATION      = concurrent_insert_scan concurrent_gamma_build
-# ISOLATION_OPTS = --inputdir=test --outputdir=test
+ISOLATION      = concurrent_insert_scan concurrent_gamma_build
+ISOLATION_OPTS = --inputdir=test --outputdir=test
 
 PG_CPPFLAGS = -I./src -Wno-unused-parameter
 PG_CONFIG   ?= pg_config
@@ -32,9 +34,9 @@ include $(PGXS)
 src/pg_acorn.o:   src/acorn_hook.h src/acorn_am.h
 src/acorn_hook.o: src/acorn_hook.h src/acorn_scan.h
 src/acorn_am.o:   src/acorn_am.h   src/acorn_scan.h src/acorn_cost.h
-src/acorn_build.o: src/acorn_am.h
+src/acorn_build.o: src/acorn_am.h   src/hnsw_compat.h
 src/acorn_scan.o:  src/acorn_scan.h src/hnsw_compat.h
-src/acorn_cost.o:  src/acorn_cost.h
+src/acorn_cost.o:  src/acorn_cost.h src/acorn_am.h
 
 # Unit tests — standalone C binaries, no PostgreSQL dependency.
 # Tests cover algorithm logic extracted in test/unit/*.c (self-contained stubs).

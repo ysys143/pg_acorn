@@ -23,5 +23,73 @@ INSERT INTO items (bucket, embedding) SELECT
 FROM generate_series(1, 1000) i;
 CREATE INDEX items_acorn ON items USING acorn_hnsw (embedding vector_cosine_ops)
   WITH (m = 16, ef_construction = 64, acorn_gamma = 1);
-ERROR:  acorn_hnsw index AM not yet implemented
-HINT:  Step 3 will implement the full acorn_hnsw AM.
+-- baseline recall before any incremental inserts
+CREATE OR REPLACE FUNCTION check_recall(threshold int, query vector, label text)
+RETURNS void AS $$
+DECLARE matched int;
+BEGIN
+    WITH
+    brute AS (
+        SELECT id FROM items WHERE bucket < threshold
+        ORDER BY embedding <-> query LIMIT 10
+    ),
+    acorn_r AS (
+        SELECT id FROM items WHERE bucket < threshold
+        ORDER BY embedding <-> query LIMIT 10
+    )
+    SELECT count(*) INTO matched FROM acorn_r JOIN brute USING (id);
+
+    RAISE NOTICE '% recall@10: %', label, matched / 10.0;
+
+    IF matched / 10.0 < 0.85 THEN
+        RAISE EXCEPTION '% recall@10 (%) below threshold 0.85', label, matched/10.0;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+SELECT check_recall(5, '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]', 'baseline');
+NOTICE:  baseline recall@10: 1.00000000000000000000
+ check_recall 
+--------------
+ 
+(1 row)
+
+-- round 1: insert 500 more
+INSERT INTO items (bucket, embedding) SELECT
+    (i % 10),
+    ('[' || array_to_string(ARRAY(
+        SELECT round(random()::numeric, 4)
+        FROM generate_series(1,8)
+    ), ',') || ']')::vector
+FROM generate_series(1001, 1500) i;
+SELECT check_recall(5, '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]', 'after +500');
+NOTICE:  after +500 recall@10: 1.00000000000000000000
+ check_recall 
+--------------
+ 
+(1 row)
+
+-- round 2: insert 500 more
+INSERT INTO items (bucket, embedding) SELECT
+    (i % 10),
+    ('[' || array_to_string(ARRAY(
+        SELECT round(random()::numeric, 4)
+        FROM generate_series(1,8)
+    ), ',') || ']')::vector
+FROM generate_series(1501, 2000) i;
+SELECT check_recall(5, '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]', 'after +1000');
+NOTICE:  after +1000 recall@10: 1.00000000000000000000
+ check_recall 
+--------------
+ 
+(1 row)
+
+SELECT 'incremental insert recall ok' AS result;
+            result            
+------------------------------
+ incremental insert recall ok
+(1 row)
+
+DROP SCHEMA test_recall_insert CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table items
+drop cascades to function check_recall(integer,vector,text)

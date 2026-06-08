@@ -26,5 +26,29 @@ CREATE INDEX hnsw_idx   ON items USING hnsw       (embedding vector_cosine_ops)
   WITH (m = 4, ef_construction = 16);
 CREATE INDEX acorn_idx  ON items USING acorn_hnsw  (embedding vector_cosine_ops)
   WITH (m = 4, ef_construction = 16, acorn_gamma = 1);
-ERROR:  acorn_hnsw index AM not yet implemented
-HINT:  Step 3 will implement the full acorn_hnsw AM.
+-- unfiltered: both indexes must return same top-3
+SET enable_seqscan = off;
+SELECT 'hnsw' AS src, id FROM items
+ORDER BY embedding <-> '[1.0,0.1,0.0,0.0]' LIMIT 3;
+ src  | id 
+------+----
+ hnsw |  1
+ hnsw |  5
+ hnsw |  8
+(3 rows)
+
+-- force acorn_hnsw (hnsw_idx will be preferred by default if both exist;
+-- drop hnsw_idx to force acorn path)
+DROP INDEX hnsw_idx;
+SELECT 'acorn' AS src, id FROM items
+ORDER BY embedding <-> '[1.0,0.1,0.0,0.0]' LIMIT 3;
+  src  | id 
+-------+----
+ acorn |  1
+ acorn |  5
+ acorn |  8
+(3 rows)
+
+RESET enable_seqscan;
+DROP SCHEMA test_no_regression CASCADE;
+NOTICE:  drop cascades to table items

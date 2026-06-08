@@ -32,10 +32,12 @@ teardown
 session "scanner"
 step "begin_scan"  { BEGIN; }
 step "run_scan"    {
-    SELECT count(*) FROM concurrent_items
-    WHERE bucket < 3
-    ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]'
-    LIMIT 10;
+    SELECT count(*) FROM (
+        SELECT id FROM concurrent_items
+        WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]'
+        LIMIT 10
+    ) sub;
 }
 step "end_scan"    { COMMIT; }
 

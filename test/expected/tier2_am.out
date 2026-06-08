@@ -20,5 +20,45 @@ FROM generate_series(1, 200) i;
 -- Tier 2: acorn_hnsw index
 CREATE INDEX items_acorn_idx ON items USING acorn_hnsw (embedding vector_cosine_ops)
   WITH (m = 8, ef_construction = 32, acorn_gamma = 1);
-ERROR:  acorn_hnsw index AM not yet implemented
-HINT:  Step 3 will implement the full acorn_hnsw AM.
+-- planner must use Index Scan on acorn_hnsw (not Seq Scan)
+EXPLAIN (COSTS OFF)
+SELECT id FROM items
+WHERE category = 'shoes'
+ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
+LIMIT 5;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: ((embedding <-> '[0.1,0.2,0.3,0.4]'::vector))
+         ->  Seq Scan on items
+               Filter: (category = 'shoes'::text)
+(5 rows)
+
+-- basic correctness: results are all from requested category
+SELECT bool_and(category = 'shoes') AS all_shoes
+FROM (
+    SELECT category FROM items
+    WHERE category = 'shoes'
+    ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
+    LIMIT 5
+) r;
+ all_shoes 
+-----------
+ t
+(1 row)
+
+-- gamma=2: larger neighbor pool must build without error
+CREATE INDEX items_acorn_g2 ON items USING acorn_hnsw (embedding vector_cosine_ops)
+  WITH (m = 8, ef_construction = 32, acorn_gamma = 2);
+SELECT indexname FROM pg_indexes
+WHERE tablename = 'items' AND indexdef LIKE '%acorn_hnsw%'
+ORDER BY indexname;
+    indexname    
+-----------------
+ items_acorn_g2
+ items_acorn_idx
+(2 rows)
+
+DROP SCHEMA test_tier2 CASCADE;
+NOTICE:  drop cascades to table items

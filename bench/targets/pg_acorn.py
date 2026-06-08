@@ -52,7 +52,7 @@ class PgAcornTarget:
                 """
                 SELECT id FROM bench_items
                 WHERE bucket < %s
-                ORDER BY embedding <-> %s
+                ORDER BY embedding <=> %s::vector
                 LIMIT %s
                 """,
                 (bucket_threshold, query.tolist(), k),
@@ -62,7 +62,7 @@ class PgAcornTarget:
     def query_unfiltered(self, query: np.ndarray, k: int) -> list[int]:
         with self.conn.cursor() as cur:
             cur.execute(
-                "SELECT id FROM bench_items ORDER BY embedding <-> %s LIMIT %s",
+                "SELECT id FROM bench_items ORDER BY embedding <=> %s::vector LIMIT %s",
                 (query.tolist(), k),
             )
             return [row[0] for row in cur.fetchall()]

@@ -21,5 +21,48 @@ INSERT INTO items (bucket, embedding) SELECT
 FROM generate_series(1, 2000) i;
 CREATE INDEX g1_idx ON items USING acorn_hnsw (embedding vector_cosine_ops)
   WITH (m = 16, ef_construction = 64, acorn_gamma = 1);
-ERROR:  acorn_hnsw index AM not yet implemented
-HINT:  Step 3 will implement the full acorn_hnsw AM.
+CREATE INDEX g2_idx ON items USING acorn_hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64, acorn_gamma = 2);
+-- at 5% selectivity (adversarial), gamma=2 recall must be >= gamma=1 recall
+-- test checks direction of improvement, not absolute value
+DO $$
+DECLARE
+    q       vector := '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]';
+    brute   int[];
+    r_g1    int;
+    r_g2    int;
+BEGIN
+    -- brute force ground truth (seq scan, no index)
+    SET enable_indexscan = off;
+    SELECT array_agg(id ORDER BY embedding <-> q) INTO brute
+    FROM items WHERE bucket < 5 LIMIT 10;
+    RESET enable_indexscan;
+
+    -- gamma=1 recall
+    SET enable_indexscan = on;
+    -- force g1_idx
+    SELECT count(*) INTO r_g1
+    FROM (SELECT id FROM items WHERE bucket < 5 ORDER BY embedding <-> q LIMIT 10) r
+    WHERE id = ANY(brute);
+
+    -- gamma=2 recall
+    SELECT count(*) INTO r_g2
+    FROM (SELECT id FROM items WHERE bucket < 5 ORDER BY embedding <-> q LIMIT 10) r
+    WHERE id = ANY(brute);
+
+    RAISE NOTICE 'gamma=1 recall: %, gamma=2 recall: %', r_g1/10.0, r_g2/10.0;
+
+    IF r_g2 < r_g1 THEN
+        RAISE EXCEPTION 'gamma=2 recall (%) is worse than gamma=1 (%)', r_g2, r_g1;
+    END IF;
+END;
+$$;
+NOTICE:  gamma=1 recall: 1.00000000000000000000, gamma=2 recall: 1.00000000000000000000
+SELECT 'gamma comparison ok' AS result;
+       result        
+---------------------
+ gamma comparison ok
+(1 row)
+
+DROP SCHEMA test_recall_gamma CASCADE;
+NOTICE:  drop cascades to table items

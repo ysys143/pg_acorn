@@ -47,7 +47,7 @@ def build_ground_truth(pgvector: PgvectorTarget,
             for i, q in enumerate(queries):
                 cur.execute(
                     "SELECT id FROM bench_items WHERE bucket < %s "
-                    "ORDER BY embedding <-> %s LIMIT %s",
+                    "ORDER BY embedding <=> %s::vector LIMIT %s",
                     (sel, q.tolist(), k),
                 )
                 truth[(sel, i)] = [r[0] for r in cur.fetchall()]

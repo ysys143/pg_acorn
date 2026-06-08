@@ -39,6 +39,23 @@
  */
 #define HNSW_MAX_NEIGHBORS		(HNSW_MAX_M * 2)
 
+/* Largest tuple that fits on a page (mirrors pgvector's HNSW_MAX_SIZE) */
+#define HNSW_MAX_SIZE \
+	(BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - \
+	 MAXALIGN(sizeof(HnswPageOpaqueData)) - sizeof(ItemIdData))
+
+/*
+ * On-disk tuple sizes (MAXALIGNed), matching pgvector 0.8.0.  The element
+ * header is sizeof(HnswElementTupleData) (= offsetof(data) = 72) followed by
+ * the inline vector; the neighbor header is sizeof(HnswNeighborTupleData)
+ * (= offsetof(indextids) = 4) followed by (level+2)*m ItemPointerData slots.
+ */
+#define HNSW_ELEMENT_TUPLE_SIZE(vsize) \
+	MAXALIGN(sizeof(HnswElementTupleData) + (vsize))
+#define HNSW_NEIGHBOR_TUPLE_SIZE(level, m) \
+	MAXALIGN(sizeof(HnswNeighborTupleData) + \
+			 ((level) + 2) * (m) * sizeof(ItemPointerData))
+
 /* -----------------------------------------------------------------------
  * Page opaque — at PageGetSpecialPointer(page)
  * ----------------------------------------------------------------------- */
