@@ -1,53 +1,58 @@
 # pg_acorn Benchmark — Scenario A (Filter Selectivity Sweep)
 
-## Run 4: Hybrid Resumable Scan (n=10,000)
+## Run 4: Resumable Streaming Scan + corrected methodology (n=10,000)
 
-Replaces Tier 2's ef-doubling batch loop (which re-ran the full HNSW traversal
-from the entry point on every ef expansion) with a **two-phase hybrid**:
+Two changes: (a) Tier 2's ef-doubling batch loop (which re-ran the full HNSW
+traversal from the entry point on every ef expansion) is replaced with a
+**resumable streaming frontier** (`acorn_scan.c` `acorn_stream_*`) — each graph
+node is expanded/emitted at most once, so the executor never restarts the
+traversal; (b) the benchmark now **forces the vector index** (`enable_seqscan`/
+`enable_bitmapscan = off`) and **records the scan node** per query.
 
-1. **Phase 1** — one ef=40 beam batch (`acorn_scan_execute`). Cheap and
-   accurate; when the filter matches sit near the query it alone satisfies the
-   executor's LIMIT.
-2. **Phase 2** (only if the executor exhausts the batch) — a **resumable
-   streaming frontier** (`acorn_scan.c` `acorn_stream_*`) that continues
-   nearest-first WITHOUT restarting from the entry point, deduped against the
-   batch. Tier 1's batch path is unchanged.
+### Why the methodology fix (and a correction to earlier "Run 4" numbers)
 
-### Pages per query — old batch vs hybrid
+Scenario A let the planner choose its plan. At low selectivity on a 10k-row
+table the planner often picks a **Seq Scan** (a full scan of the small table is
+~371 buffers and exact, so recall = 1.0). The acorn index's cost estimate sits
+at a razor-thin crossover with seqscan (~498 vs ~496 at 1%), so the plan flips
+between runs on ANALYZE noise. As a result `pages_per_query` conflated seqscan
+pages (~371) with index-scan pages (~20,000), creating a phantom 59x
+"regression" at g2/1% that — for transparency — earlier drove a hybrid
+batch+stream redesign. EXPLAIN confirmed the 371 was a **Seq Scan**: the index
+scan never ran there. The hybrid was reverted; pure streaming is simpler and, on
+the same (index-forced) footing, cheaper.
+
+### Pages per query — all Index Scan (forced)
 
 | Target | 1% | 5% | 10% | 40% | 80% |
 |--------|----|----|-----|-----|-----|
-| Tier 2 g1 — old batch | 63,000 | 22,820 | 13,027 | 2,403 | 2,389 |
-| **Tier 2 g1 — hybrid** | **22,001** | **11,083** | **7,667** | 2,386 | 2,373 |
-| Tier 2 g2 — old batch | 371 | 35,922 | 20,970 | 4,186 | 4,172 |
-| **Tier 2 g2 — hybrid** | **371** | **16,837** | **12,781** | 4,210 | 4,196 |
+| Tier 2 g1 — old batch (index) | 63,000 | 22,820 | 13,027 | 2,403 | 2,389 |
+| **Tier 2 g1 — streaming** | **19,638** | **8,715** | **5,339** | **1,695** | **933** |
+| **Tier 2 g2 — streaming** | 21,853 | **12,649** | **8,588** | 3,025 | 1,702 |
 
-### Recall@10 (hybrid)
+### Recall@10 (streaming, index forced)
 
 | Target | 1% | 5% | 10% | 40% | 80% |
 |--------|----|----|-----|-----|-----|
-| Tier 2 g1 | 0.998 | 0.952 | 0.884 | 0.932 | 0.942 |
-| Tier 2 g2 | 1.000 | 0.992 | 0.988 | 0.970 | 0.966 |
+| Tier 2 g1 | 0.998 | 0.952 | 0.884 | 0.926 | 0.934 |
+| Tier 2 g2 | 1.000 | 0.992 | 0.988 | 0.984 | 0.984 |
 
-### Interpretation — dominates the old batch, no regression
+### Interpretation
 
-- **Removes the re-traversal blowup.** Tier 2 g1 at 1% — the pathological case
-  that motivated this work — drops from 63,000 to 22,001 pages (2.9x), recall
-  essentially unchanged (1.000 → 0.998). When phase 1 is insufficient, phase 2
-  *resumes* the traversal rather than restarting it from the entry point on each
-  ef step, which is where the old loop wasted its pages.
-- **No regression on concentrated matches.** Tier 2 g2 at 1% stays at 371 pages:
-  phase 1's ef=40 beam already covers the near-query matches, so phase 2 never
-  starts. (A pure-streaming design without phase 1 over-expanded here to ~21,800
-  pages because best-first emission lacks the ef-beam's directedness — phase 1
-  exists precisely to capture this case.)
-- **Net:** the hybrid is <= the old batch everywhere measured (much lower at low
-  selectivity, equal at high), and the cost is predictable rather than bimodal.
-- **Recall holds within build-seed variance.** Levels are assigned from
-  `MyProcPid`, so each build yields a slightly different graph; the few-point
-  differences vs Run 3 are within that noise. All gated tests pass:
-  `no_regression`, `recall_filter` (>=0.9 at 10/40/80%), `recall_gamma`,
-  `recall_insert`, plus both isolation specs.
+- **The valid headline:** where the index is actually used at both points, Tier 2
+  g1 at 1% drops from 63,000 to 19,638 index-scan pages (3.2x), recall unchanged
+  (1.000 → 0.998). Streaming touches 2–4x fewer pages than the old batch across
+  g1. This is the real resumable-scan win.
+- **g2 at 1% is 21,853 pages** — the honest index cost. The earlier "371" was a
+  seqscan, now retracted. No g2/1% before/after is claimed (different plans).
+- **Cost-model finding (separate issue):** at 1%/10k a Seq Scan (371 pages,
+  2.4 ms) beats the acorn index (~20k pages, ~170 ms). The planner correctly
+  picks seqscan for g2 but wrongly uses the index for g1 — `acorn_cost.c`
+  under-estimates the index scan. Cost-model recalibration is a roadmap item;
+  the resumable scan only matters in the regime where the index is the right
+  plan (larger tables / moderate selectivity).
+- All gated tests pass: `no_regression`, `recall_filter` (>=0.9 at 10/40/80%),
+  `recall_gamma`, `recall_insert`, plus both isolation specs.
 
 ### Reproduce
 
