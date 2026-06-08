@@ -2,6 +2,7 @@
 #define ACORN_SCAN_H
 
 #include "postgres.h"
+#include "access/skey.h"
 #include "nodes/execnodes.h"
 #include "utils/relcache.h"
 
@@ -56,5 +57,28 @@ AcornStreamScan *acorn_stream_begin(Relation index,
 									MemoryContext mcxt);
 
 bool acorn_stream_next(AcornStreamScan *stream, ItemPointerData *heaptid_out);
+
+/*
+ * Tier 2 in-filter streaming scan.
+ *
+ * Extends the resumable frontier with ScanKey filter evaluation against the
+ * inline filter_val stored in each AcornT2 element tuple.  Filter-failing
+ * nodes are kept in the candidate set C (connectivity) but not added to R
+ * (results), so no heap fetch is needed for scalar predicates.
+ *
+ * keys / nkeys point directly into the IndexScanDesc's keyData array;
+ * caller must ensure they remain valid for the lifetime of the scan.
+ */
+typedef struct AcornT2StreamScan AcornT2StreamScan;
+
+AcornT2StreamScan *acorn_t2_stream_begin(Relation index,
+										  Datum query_vec,
+										  ScanKey keys,
+										  int nkeys,
+										  Snapshot snapshot,
+										  MemoryContext mcxt);
+
+bool acorn_t2_stream_next(AcornT2StreamScan *stream,
+						   ItemPointerData *heaptid_out);
 
 #endif /* ACORN_SCAN_H */

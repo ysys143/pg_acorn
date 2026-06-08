@@ -26,6 +26,8 @@
 
 #include "acorn_scan.h"
 #include "hnsw_compat.h"
+#include "acorn_t2_page.h"
+#include "access/stratnum.h"
 
 /* -----------------------------------------------------------------------
  * Internal element reference
@@ -788,6 +790,400 @@ acorn_stream_next(AcornStreamScan *s, ItemPointerData *heaptid_out)
 		if (pairingheap_is_empty(s->R))
 		{
 			s->exhausted = true;		/* graph fully streamed */
+			MemoryContextSwitchTo(old);
+			return false;
+		}
+
+		{
+			AcornPQNode *rn = (AcornPQNode *) pairingheap_remove_first(s->R);
+			*heaptid_out = rn->elem.heaptid;
+			pfree(rn);
+			MemoryContextSwitchTo(old);
+			return true;
+		}
+	}
+}
+
+/* -----------------------------------------------------------------------
+ * Tier 2 in-filter traversal
+ *
+ * Uses AcornT2 element tuple format (acorn_t2_page.h).  Evaluates scalar
+ * ScanKey predicates against the inline filter_val — no heap fetch.
+ *
+ * ACORN invariant preserved: filter-failing nodes go to C only (connectivity);
+ * filter-passing nodes go to both C and R (candidate + result).
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Load a Tier-2 element tuple.  Mirrors acorn_load_element but casts to
+ * AcornT2ElementTuple and also returns filter_val (may be NULL).
+ */
+static Buffer
+acorn_t2_load_element(Relation index, BlockNumber blkno, OffsetNumber offno,
+					   ItemPointerData *heaptid_out, int *level_out,
+					   bool *deleted_out,
+					   BlockNumber *nbr_blkno_out, OffsetNumber *nbr_offno_out,
+					   int64 *filter_val_out)
+{
+	Buffer				buf;
+	Page				page;
+	ItemId				iid;
+	AcornT2ElementTuple etup;
+
+	buf  = ReadBuffer(index, blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	iid  = PageGetItemId(page, offno);
+	etup = (AcornT2ElementTuple) PageGetItem(page, iid);
+
+	*heaptid_out   = etup->heaptids[0];
+	*level_out     = (int) etup->level;
+	*deleted_out   = (etup->deleted != 0);
+	*nbr_blkno_out = ItemPointerGetBlockNumber(&etup->neighbortid);
+	*nbr_offno_out = ItemPointerGetOffsetNumber(&etup->neighbortid);
+	if (filter_val_out)
+		*filter_val_out = etup->filter_val;
+
+	/* Buffer remains locked — caller must UnlockReleaseBuffer */
+	return buf;
+}
+
+/*
+ * Distance using the T2 vector accessor (offset 80, not 72).
+ */
+static double
+acorn_t2_distance(Relation index, BlockNumber blkno, OffsetNumber offno,
+				   Datum query, FmgrInfo *dist_proc)
+{
+	Buffer				buf;
+	Page				page;
+	ItemId				iid;
+	AcornT2ElementTuple etup;
+	Datum				result;
+
+	buf  = ReadBuffer(index, blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	iid  = PageGetItemId(page, offno);
+	etup = (AcornT2ElementTuple) PageGetItem(page, iid);
+
+	result = FunctionCall2(dist_proc,
+						   PointerGetDatum(AcornT2ElementTupleGetVector(etup)),
+						   query);
+
+	UnlockReleaseBuffer(buf);
+	return DatumGetFloat8(result);
+}
+
+/*
+ * Evaluate all ScanKey quals against stored_val.
+ * sk_func is the opclass compare function (btint4cmp, etc.).
+ * Strategy numbers: 1=< 2=<= 3== 4=>= 5=>.
+ * Returns true if all quals pass, or when nkeys == 0.
+ */
+static bool
+acorn_t2_eval_filter(ScanKey keys, int nkeys, int64 stored_val)
+{
+	int i;
+
+	for (i = 0; i < nkeys; i++)
+	{
+		int32 cmp = DatumGetInt32(
+			FunctionCall2Coll(&keys[i].sk_func,
+							   keys[i].sk_collation,
+							   (Datum) stored_val,
+							   keys[i].sk_argument));
+		bool  passes;
+
+		switch (keys[i].sk_strategy)
+		{
+			case BTLessStrategyNumber:			passes = (cmp < 0);  break;
+			case BTLessEqualStrategyNumber:		passes = (cmp <= 0); break;
+			case BTEqualStrategyNumber:			passes = (cmp == 0); break;
+			case BTGreaterEqualStrategyNumber:	passes = (cmp >= 0); break;
+			case BTGreaterStrategyNumber:		passes = (cmp > 0);  break;
+			default:							passes = false;		 break;
+		}
+
+		if (!passes)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Greedy descent for T2 format — mirrors acorn_greedy_descent using T2
+ * element loader and distance function.
+ */
+static void
+acorn_t2_greedy_descent(Relation index, int m,
+						  BlockNumber *cur_blkno, OffsetNumber *cur_offno,
+						  int start_level, int target_level,
+						  Datum query, FmgrInfo *dist_proc)
+{
+	double cur_dist = acorn_t2_distance(index, *cur_blkno, *cur_offno,
+										 query, dist_proc);
+
+	for (int lc = start_level; lc > target_level; lc--)
+	{
+		bool improved;
+
+		do {
+			ItemPointerData neighbors[HNSW_MAX_NEIGHBORS];
+			ItemPointerData cur_heaptid;
+			int				cur_level;
+			bool			cur_deleted;
+			BlockNumber		nbr_blkno;
+			OffsetNumber	nbr_offno;
+			Buffer			ebuf;
+			int				n_count;
+
+			improved = false;
+
+			ebuf = acorn_t2_load_element(index, *cur_blkno, *cur_offno,
+										  &cur_heaptid, &cur_level, &cur_deleted,
+										  &nbr_blkno, &nbr_offno, NULL);
+			UnlockReleaseBuffer(ebuf);
+
+			n_count = acorn_get_neighbors(index, nbr_blkno, nbr_offno,
+										   cur_level, lc, m, neighbors,
+										   HNSW_MAX_NEIGHBORS);
+
+			for (int i = 0; i < n_count; i++)
+			{
+				BlockNumber  nblkno  = ItemPointerGetBlockNumber(&neighbors[i]);
+				OffsetNumber noffno  = ItemPointerGetOffsetNumber(&neighbors[i]);
+				double		 nd;
+
+				if (!ItemPointerIsValid(&neighbors[i]))
+					continue;
+
+				nd = acorn_t2_distance(index, nblkno, noffno, query, dist_proc);
+				if (nd < cur_dist)
+				{
+					cur_dist   = nd;
+					*cur_blkno = nblkno;
+					*cur_offno = noffno;
+					improved   = true;
+				}
+			}
+		} while (improved);
+	}
+}
+
+/* Persistent in-filter streaming frontier for Tier 2. */
+struct AcornT2StreamScan
+{
+	Relation		index;
+	FmgrInfo		dist_proc;
+	Datum			query;
+	int				m;
+	pairingheap	   *C;			/* candidates to expand (min-heap) */
+	pairingheap	   *R;			/* discovered passing nodes, awaiting emit */
+	HTAB		   *visited;
+	MemoryContext	mcxt;
+	bool			exhausted;
+	ScanKey			keys;		/* filter ScanKeys (lives in caller's memory) */
+	int				nkeys;
+};
+
+/*
+ * Expand one T2 candidate: add unvisited layer-0 neighbors to C; add to R
+ * only those that pass the filter.  Filter-failing nodes go to C only —
+ * this is the ACORN invariant that preserves graph connectivity.
+ */
+static void
+acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
+{
+	ItemPointerData neighbors[HNSW_MAX_NEIGHBORS];
+	ItemPointerData ce_heaptid;
+	int				ce_level;
+	bool			ce_deleted;
+	BlockNumber		nbr_blkno;
+	OffsetNumber	nbr_offno;
+	Buffer			ebuf;
+	int				n_count;
+
+	ebuf = acorn_t2_load_element(s->index,
+								  ItemPointerGetBlockNumber(&ce->indextid),
+								  ItemPointerGetOffsetNumber(&ce->indextid),
+								  &ce_heaptid, &ce_level, &ce_deleted,
+								  &nbr_blkno, &nbr_offno, NULL);
+	UnlockReleaseBuffer(ebuf);
+
+	n_count = acorn_get_neighbors(s->index, nbr_blkno, nbr_offno,
+								   ce_level, 0, s->m, neighbors,
+								   HNSW_MAX_NEIGHBORS);
+
+	for (int i = 0; i < n_count; i++)
+	{
+		BlockNumber		nblkno;
+		OffsetNumber	noffno;
+		double			nd;
+		ItemPointerData nheaptid;
+		int				nlevel;
+		bool			ndeleted;
+		BlockNumber		n_nbr_blkno;
+		OffsetNumber	n_nbr_offno;
+		int64			nfilter_val;
+		Buffer			nbuf;
+		AcornPQNode	   *cn;
+
+		if (!ItemPointerIsValid(&neighbors[i]))
+			continue;
+		if (is_visited(s->visited, &neighbors[i]))
+			continue;
+		mark_visited(s->visited, &neighbors[i]);
+
+		nblkno = ItemPointerGetBlockNumber(&neighbors[i]);
+		noffno = ItemPointerGetOffsetNumber(&neighbors[i]);
+		nd     = acorn_t2_distance(s->index, nblkno, noffno,
+								   s->query, &s->dist_proc);
+
+		/* Always add to C — ACORN invariant: preserve connectivity */
+		cn = palloc(sizeof(AcornPQNode));
+		ItemPointerCopy(&neighbors[i], &cn->elem.indextid);
+		ItemPointerSetInvalid(&cn->elem.heaptid);
+		cn->elem.distance = nd;
+		pairingheap_add(s->C, &cn->ph_node);
+
+		/* Load heaptid, deleted flag, and stored filter value */
+		nbuf = acorn_t2_load_element(s->index, nblkno, noffno,
+									  &nheaptid, &nlevel, &ndeleted,
+									  &n_nbr_blkno, &n_nbr_offno, &nfilter_val);
+		UnlockReleaseBuffer(nbuf);
+
+		if (ndeleted)
+			continue;
+
+		/* Add to R only when filter passes — no heap fetch needed */
+		if (acorn_t2_eval_filter(s->keys, s->nkeys, nfilter_val))
+		{
+			AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+			ItemPointerCopy(&neighbors[i], &rn->elem.indextid);
+			ItemPointerCopy(&nheaptid, &rn->elem.heaptid);
+			rn->elem.distance = nd;
+			pairingheap_add(s->R, &rn->ph_node);
+		}
+	}
+}
+
+AcornT2StreamScan *
+acorn_t2_stream_begin(Relation index, Datum query,
+					   ScanKey keys, int nkeys,
+					   Snapshot snapshot, MemoryContext mcxt)
+{
+	MemoryContext		old = MemoryContextSwitchTo(mcxt);
+	AcornT2StreamScan  *s  = palloc0(sizeof(AcornT2StreamScan));
+	BlockNumber			entry_blkno;
+	OffsetNumber		entry_offno;
+	int					entry_level;
+	int					m;
+	HASHCTL				info;
+
+	(void) snapshot;			/* visibility handled by executor post-fetch */
+
+	s->index     = index;
+	s->query     = query;
+	s->mcxt      = mcxt;
+	s->keys      = keys;
+	s->nkeys     = nkeys;
+	s->exhausted = false;
+	acorn_load_dist_proc(index, &s->dist_proc);
+
+	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m))
+	{
+		s->exhausted = true;		/* empty index */
+		MemoryContextSwitchTo(old);
+		return s;
+	}
+	s->m = m;
+
+	if (entry_level > 0)
+		acorn_t2_greedy_descent(index, m, &entry_blkno, &entry_offno,
+								 entry_level, 0, query, &s->dist_proc);
+
+	s->C = pairingheap_allocate(pq_cmp_min, NULL);
+	s->R = pairingheap_allocate(pq_cmp_min, NULL);
+
+	memset(&info, 0, sizeof(info));
+	info.keysize   = sizeof(ItemPointerData);
+	info.entrysize = sizeof(VisitedEntry);
+	info.hcxt      = mcxt;
+	s->visited = hash_create("acorn_t2_stream_visited", 512, &info,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/* Seed the frontier with the base-layer entry point */
+	{
+		ItemPointerData entry_tid;
+		ItemPointerData heaptid;
+		int				lvl;
+		bool			deleted;
+		BlockNumber		nb;
+		OffsetNumber	no;
+		int64			fval;
+		Buffer			eb;
+		double			d;
+		AcornPQNode	   *cn;
+
+		ItemPointerSet(&entry_tid, entry_blkno, entry_offno);
+		mark_visited(s->visited, &entry_tid);
+
+		d  = acorn_t2_distance(index, entry_blkno, entry_offno,
+							   query, &s->dist_proc);
+		eb = acorn_t2_load_element(index, entry_blkno, entry_offno,
+								    &heaptid, &lvl, &deleted, &nb, &no, &fval);
+		UnlockReleaseBuffer(eb);
+
+		cn = palloc(sizeof(AcornPQNode));
+		ItemPointerCopy(&entry_tid, &cn->elem.indextid);
+		ItemPointerSetInvalid(&cn->elem.heaptid);
+		cn->elem.distance = d;
+		pairingheap_add(s->C, &cn->ph_node);
+
+		if (!deleted && acorn_t2_eval_filter(keys, nkeys, fval))
+		{
+			AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+			ItemPointerCopy(&entry_tid, &rn->elem.indextid);
+			ItemPointerCopy(&heaptid, &rn->elem.heaptid);
+			rn->elem.distance = d;
+			pairingheap_add(s->R, &rn->ph_node);
+		}
+	}
+
+	MemoryContextSwitchTo(old);
+	return s;
+}
+
+bool
+acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
+{
+	MemoryContext old;
+
+	if (s->exhausted)
+		return false;
+
+	old = MemoryContextSwitchTo(s->mcxt);
+
+	for (;;)
+	{
+		double r_dist = pairingheap_is_empty(s->R) ? DBL_MAX
+			: ((AcornPQNode *) pairingheap_first(s->R))->elem.distance;
+		double c_dist = pairingheap_is_empty(s->C) ? DBL_MAX
+			: ((AcornPQNode *) pairingheap_first(s->C))->elem.distance;
+
+		if (!pairingheap_is_empty(s->C) && c_dist <= r_dist)
+		{
+			AcornPQNode *cn = (AcornPQNode *) pairingheap_remove_first(s->C);
+			AcornElem	 ce = cn->elem;
+			pfree(cn);
+			acorn_t2_stream_expand(s, &ce);
+			continue;
+		}
+
+		if (pairingheap_is_empty(s->R))
+		{
+			s->exhausted = true;
 			MemoryContextSwitchTo(old);
 			return false;
 		}

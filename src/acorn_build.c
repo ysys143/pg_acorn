@@ -41,7 +41,7 @@
 
 #include "pg_acorn.h"
 #include "acorn_am.h"
-#include "hnsw_compat.h"
+#include "acorn_t2_page.h"
 
 /*
  * Cap random levels so neighbor tuples remain page-sized.
@@ -300,17 +300,17 @@ acorn_read_element(Relation index, ForkNumber forkNum, ItemPointer tid,
 				   BlockNumber *nbr_blkno, OffsetNumber *nbr_offno,
 				   Datum *vec_copy)
 {
-	Buffer			 buf;
-	Page			 page;
-	HnswElementTuple etup;
-	Pointer			 vec;
-	Size			 vsize;
+	Buffer				buf;
+	Page				page;
+	AcornT2ElementTuple etup;
+	Pointer				vec;
+	Size				vsize;
 
 	buf  = ReadBufferExtended(index, forkNum,
 							  ItemPointerGetBlockNumber(tid), RBM_NORMAL, NULL);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-	etup = (HnswElementTuple) PageGetItem(page,
+	etup = (AcornT2ElementTuple) PageGetItem(page,
 				PageGetItemId(page, ItemPointerGetOffsetNumber(tid)));
 
 	if (level_out)
@@ -321,7 +321,7 @@ acorn_read_element(Relation index, ForkNumber forkNum, ItemPointer tid,
 		*nbr_offno = ItemPointerGetOffsetNumber(&etup->neighbortid);
 	if (vec_copy)
 	{
-		vec   = (Pointer) HnswElementTupleGetVector(etup);
+		vec   = (Pointer) AcornT2ElementTupleGetVector(etup);
 		vsize = VARSIZE_ANY(vec);
 		*vec_copy = PointerGetDatum(memcpy(palloc(vsize), vec, vsize));
 	}
@@ -334,16 +334,16 @@ acorn_node_distance(Relation index, ForkNumber forkNum,
 					BlockNumber blkno, OffsetNumber offno,
 					Datum query, FmgrInfo *proc)
 {
-	Buffer			 buf;
-	Page			 page;
-	HnswElementTuple etup;
-	double			 dist;
+	Buffer				buf;
+	Page				page;
+	AcornT2ElementTuple etup;
+	double				dist;
 
 	buf  = ReadBufferExtended(index, forkNum, blkno, RBM_NORMAL, NULL);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
-	dist = acorn_dist(proc, PointerGetDatum(HnswElementTupleGetVector(etup)), query);
+	etup = (AcornT2ElementTuple) PageGetItem(page, PageGetItemId(page, offno));
+	dist = acorn_dist(proc, PointerGetDatum(AcornT2ElementTupleGetVector(etup)), query);
 	UnlockReleaseBuffer(buf);
 	return dist;
 }
@@ -798,18 +798,19 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
  */
 static void
 acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
+					 int64 filter_val,
 					 ItemPointer heaptid, unsigned short rand_state[3])
 {
-	int				  m_eff    = acorn_m_eff(index);
-	int				  efc      = acorn_opt_ef_construction(index);
-	FmgrInfo		 *proc     = acorn_dist_proc(index);
-	Size			  vsize    = VARSIZE_ANY(DatumGetPointer(value));
-	Size			  etupSize = HNSW_ELEMENT_TUPLE_SIZE(vsize);
+	int					m_eff    = acorn_m_eff(index);
+	int					efc      = acorn_opt_ef_construction(index);
+	FmgrInfo		   *proc     = acorn_dist_proc(index);
+	Size				vsize    = VARSIZE_ANY(DatumGetPointer(value));
+	Size				etupSize = ACORN_T2_ELEMENT_TUPLE_SIZE(vsize);
 
-	int				  l_new;
-	Size			  ntupSize;
-	HnswNeighborTuple ntup;
-	HnswElementTuple  etup;
+	int					l_new;
+	Size				ntupSize;
+	HnswNeighborTuple	ntup;
+	AcornT2ElementTuple etup;
 	ItemPointerData  *ntids;
 	BlockNumber		  e_blk, n_blk;
 	OffsetNumber	  e_off, n_off;
@@ -882,18 +883,19 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 	/* Step 5: write neighbor tuple to disk */
 	acorn_append_tuple(index, forkNum, (Item) ntup, ntupSize, &n_blk, &n_off);
 
-	/* Step 6: write element tuple (level, heaptids, neighbortid, inline vector) */
-	etup           = palloc0(etupSize);
-	etup->type     = HNSW_ELEMENT_TUPLE_TYPE;
-	etup->level    = (uint8) l_new;
-	etup->deleted  = 0;
-	etup->version  = HNSW_VERSION;
+	/* Step 6: write element tuple (level, heaptids, neighbortid, filter_val, vector) */
+	etup              = palloc0(etupSize);
+	etup->type        = HNSW_ELEMENT_TUPLE_TYPE;
+	etup->level       = (uint8) l_new;
+	etup->deleted     = 0;
+	etup->version     = HNSW_VERSION;
 	for (int i = 0; i < HNSW_HEAPTIDS; i++)
 		ItemPointerSetInvalid(&etup->heaptids[i]);
 	etup->heaptids[0] = *heaptid;
 	ItemPointerSet(&etup->neighbortid, n_blk, n_off);
-	etup->unused   = 0;
-	memcpy(HnswElementTupleGetVector(etup), DatumGetPointer(value), vsize);
+	etup->unused      = 0;
+	etup->filter_val  = filter_val;
+	memcpy(AcornT2ElementTupleGetVector(etup), DatumGetPointer(value), vsize);
 
 	acorn_append_tuple(index, forkNum, (Item) etup, etupSize, &e_blk, &e_off);
 
@@ -934,6 +936,7 @@ typedef struct AcornBuildState
 	double			ntuples;
 	MemoryContext	tmpCtx;
 	unsigned short	rand_state[3];	/* pg_erand48 state for level assignment */
+	bool			has_filter;		/* true if index has a scalar filter column */
 } AcornBuildState;
 
 static void
@@ -943,14 +946,18 @@ acorn_build_callback(Relation index, ItemPointer tid, Datum *values,
 	AcornBuildState *bs = (AcornBuildState *) state;
 	MemoryContext	 oldCtx;
 	Datum			 value;
+	int64			 filter_val = 0;
 
 	if (isnull[0])
 		return;
 
 	oldCtx = MemoryContextSwitchTo(bs->tmpCtx);
 
+	if (bs->has_filter && !isnull[1])
+		filter_val = (int64) values[1];
+
 	value = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
-	acorn_insert_element(index, bs->forkNum, value, tid, bs->rand_state);
+	acorn_insert_element(index, bs->forkNum, value, filter_val, tid, bs->rand_state);
 	bs->ntuples += 1;
 
 	MemoryContextSwitchTo(oldCtx);
@@ -993,6 +1000,7 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 
 	bs.forkNum       = forkNum;
 	bs.ntuples       = 0;
+	bs.has_filter    = (RelationGetDescr(index)->natts > 1);
 	bs.tmpCtx        = AllocSetContextCreate(CurrentMemoryContext,
 											  "acorn build temp",
 											  ALLOCSET_DEFAULT_SIZES);
@@ -1061,7 +1069,13 @@ acorn_insert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 	rand_state[2] = (unsigned short)  ItemPointerGetOffsetNumber(heap_tid);
 
 	value = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
-	acorn_insert_element(index, MAIN_FORKNUM, value, heap_tid, rand_state);
+	{
+		int64 filter_val = 0;
+
+		if (indexInfo->ii_NumIndexAttrs > 1 && !isnull[1])
+			filter_val = (int64) values[1];
+		acorn_insert_element(index, MAIN_FORKNUM, value, filter_val, heap_tid, rand_state);
+	}
 
 	MemoryContextSwitchTo(oldCtx);
 	MemoryContextDelete(insertCtx);

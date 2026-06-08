@@ -89,10 +89,10 @@ acorn_validate(Oid opclassoid)
  */
 typedef struct AcornScanOpaqueData
 {
-	bool			 first;
-	Datum			 query;			/* detoasted query vector (lives in tmpCtx) */
-	AcornStreamScan *stream;		/* persistent frontier (lives in tmpCtx) */
-	MemoryContext	 tmpCtx;
+	bool				first;
+	Datum				query;		/* detoasted query vector (lives in tmpCtx) */
+	AcornT2StreamScan  *stream;		/* persistent T2 in-filter frontier */
+	MemoryContext		tmpCtx;
 } AcornScanOpaqueData;
 typedef AcornScanOpaqueData *AcornScanOpaque;
 
@@ -169,8 +169,9 @@ acorn_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 		so->query = PointerGetDatum(
 			PG_DETOAST_DATUM(scan->orderByData->sk_argument));
-		so->stream = acorn_stream_begin(scan->indexRelation, so->query,
-										scan->xs_snapshot, so->tmpCtx);
+		so->stream = acorn_t2_stream_begin(scan->indexRelation, so->query,
+										   scan->keyData, scan->numberOfKeys,
+										   scan->xs_snapshot, so->tmpCtx);
 		so->first = false;
 
 		MemoryContextSwitchTo(oldCtx);
@@ -179,7 +180,7 @@ acorn_gettuple(IndexScanDesc scan, ScanDirection dir)
 	{
 		ItemPointerData tid;
 
-		if (!acorn_stream_next(so->stream, &tid))
+		if (!acorn_t2_stream_next(so->stream, &tid))
 			return false;
 
 		scan->xs_heaptid        = tid;
