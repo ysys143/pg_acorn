@@ -19,6 +19,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -80,13 +81,33 @@ acorn_validate(Oid opclassoid)
  * Scan
  * ----------------------------------------------------------------------- */
 
+/*
+ * Maximum ef allowed during iterative expansion.  At 1% selectivity with
+ * k=10, ef ≈ 1000 is needed for good recall; 4096 gives comfortable headroom.
+ */
+#define ACORN_EF_SEARCH_MAX  4096
+
+/*
+ * Hash-table entry for the "seen" set that deduplicates heap TIDs across
+ * ef-expansion rounds.  The dummy byte is required because HTAB entrysize
+ * must be strictly larger than keysize.
+ */
+typedef struct AcornSeenEntry
+{
+	ItemPointerData heaptid;
+	char			dummy;
+} AcornSeenEntry;
+
 typedef struct AcornScanOpaqueData
 {
 	bool			first;
-	int				ef;				/* number of results to buffer */
-	ItemPointerData *tids;			/* buffered heap TIDs, nearest first */
+	bool			done;			/* true when no more expansions are possible */
+	Datum			query;			/* detoasted query vector (lives in tmpCtx) */
+	int				ef;				/* current search size (doubles on each expansion) */
+	ItemPointerData *tids;			/* current search result buffer (in tmpCtx) */
 	int				count;
 	int				pos;
+	HTAB		   *seen;			/* heap TIDs already returned (in tmpCtx) */
 	MemoryContext	tmpCtx;
 } AcornScanOpaqueData;
 typedef AcornScanOpaqueData *AcornScanOpaque;
@@ -95,15 +116,17 @@ static IndexScanDesc
 acorn_beginscan(Relation index, int nkeys, int norderbys)
 {
 	IndexScanDesc	scan = RelationGetIndexScan(index, nkeys, norderbys);
-	AcornScanOpaque so = palloc0(sizeof(AcornScanOpaqueData));
+	AcornScanOpaque so   = palloc0(sizeof(AcornScanOpaqueData));
 
-	so->first = true;
-	so->ef    = ACORN_DEFAULT_EF_SEARCH;
+	so->first  = true;
+	so->done   = false;
+	so->ef     = ACORN_DEFAULT_EF_SEARCH;
 	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
 									   "acorn scan", ALLOCSET_DEFAULT_SIZES);
-	so->tids  = NULL;
-	so->count = 0;
-	so->pos   = 0;
+	so->tids   = NULL;
+	so->count  = 0;
+	so->pos    = 0;
+	so->seen   = NULL;
 
 	scan->opaque = so;
 	return scan;
