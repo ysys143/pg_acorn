@@ -20,5 +20,3 @@ FROM generate_series(1, 200) i;
 -- Tier 2: acorn_hnsw index
 CREATE INDEX items_acorn_idx ON items USING acorn_hnsw (embedding vector_cosine_ops)
   WITH (m = 8, ef_construction = 32, acorn_gamma = 1);
-ERROR:  acorn_hnsw index AM not yet implemented
-HINT:  Step 3 will implement the full acorn_hnsw AM.

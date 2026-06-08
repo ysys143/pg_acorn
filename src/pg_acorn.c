@@ -53,6 +53,9 @@ _PG_init(void)
 		NULL, NULL, NULL
 	);
 
+	/* Register acorn_hnsw reloptions (m, ef_construction, acorn_gamma) */
+	acorn_am_init();
+
 	acorn_hook_init();
 }
 
