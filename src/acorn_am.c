@@ -2,9 +2,10 @@
  * acorn_am.c — acorn_hnsw index Access Method handler (Tier 2)
  *
  * Registers the full IndexAmRoutine.  Build/insert live in acorn_build.c;
- * cost estimation in acorn_cost.c; the scan reuses the shared ACORN traversal
- * acorn_scan_execute() (predicate = NULL — a pure index AM does not see the
- * WHERE filter; the executor post-filters on the Index Scan).
+ * cost estimation in acorn_cost.c.  The scan uses the resumable streaming
+ * traversal (acorn_stream_*): a pure index AM does not see the WHERE filter, so
+ * it emits heap TIDs in approximate nearest-first order and the executor
+ * post-filters on the Index Scan, pulling more as needed.
  */
 
 #include "postgres.h"
@@ -19,7 +20,6 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
-#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -82,33 +82,17 @@ acorn_validate(Oid opclassoid)
  * ----------------------------------------------------------------------- */
 
 /*
- * Maximum ef allowed during iterative expansion.  At 1% selectivity with
- * k=10, ef ≈ 1000 is needed for good recall; 4096 gives comfortable headroom.
+ * Tier 2 streams results from a persistent ACORN frontier (acorn_scan.c
+ * acorn_stream_*): one heap TID per amgettuple in approximate nearest-first
+ * order.  Each graph node is expanded/emitted at most once, so the executor
+ * pulling past the initial candidates never re-runs the traversal.
  */
-#define ACORN_EF_SEARCH_MAX  4096
-
-/*
- * Hash-table entry for the "seen" set that deduplicates heap TIDs across
- * ef-expansion rounds.  The dummy byte is required because HTAB entrysize
- * must be strictly larger than keysize.
- */
-typedef struct AcornSeenEntry
-{
-	ItemPointerData heaptid;
-	char			dummy;
-} AcornSeenEntry;
-
 typedef struct AcornScanOpaqueData
 {
-	bool			first;
-	bool			done;			/* true when no more expansions are possible */
-	Datum			query;			/* detoasted query vector (lives in tmpCtx) */
-	int				ef;				/* current search size (doubles on each expansion) */
-	ItemPointerData *tids;			/* current search result buffer (in tmpCtx) */
-	int				count;
-	int				pos;
-	HTAB		   *seen;			/* heap TIDs already returned (in tmpCtx) */
-	MemoryContext	tmpCtx;
+	bool			 first;
+	Datum			 query;			/* detoasted query vector (lives in tmpCtx) */
+	AcornStreamScan *stream;		/* persistent frontier (lives in tmpCtx) */
+	MemoryContext	 tmpCtx;
 } AcornScanOpaqueData;
 typedef AcornScanOpaqueData *AcornScanOpaque;
 
@@ -119,14 +103,10 @@ acorn_beginscan(Relation index, int nkeys, int norderbys)
 	AcornScanOpaque so   = palloc0(sizeof(AcornScanOpaqueData));
 
 	so->first  = true;
-	so->done   = false;
-	so->ef     = ACORN_DEFAULT_EF_SEARCH;
+	so->query  = (Datum) 0;
+	so->stream = NULL;
 	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
 									   "acorn scan", ALLOCSET_DEFAULT_SIZES);
-	so->tids   = NULL;
-	so->count  = 0;
-	so->pos    = 0;
-	so->seen   = NULL;
 
 	scan->opaque = so;
 	return scan;
@@ -139,12 +119,8 @@ acorn_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	AcornScanOpaque so = (AcornScanOpaque) scan->opaque;
 
 	so->first  = true;
-	so->done   = false;
-	so->ef     = ACORN_DEFAULT_EF_SEARCH;
-	so->count  = 0;
-	so->pos    = 0;
-	so->tids   = NULL;
-	so->seen   = NULL;
+	so->query  = (Datum) 0;
+	so->stream = NULL;
 	MemoryContextReset(so->tmpCtx);
 
 	if (keys && scan->numberOfKeys > 0)
@@ -186,92 +162,30 @@ acorn_gettuple(IndexScanDesc scan, ScanDirection dir)
 		return false;
 	}
 
-	/* First call: detoast query, allocate seen set, run initial search */
+	/* First call: detoast query and start the streaming frontier */
 	if (so->first)
 	{
-		MemoryContext	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
-		AcornScanState	st;
-		HASHCTL			hctl;
+		MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
 		so->query = PointerGetDatum(
 			PG_DETOAST_DATUM(scan->orderByData->sk_argument));
-
-		memset(&hctl, 0, sizeof(hctl));
-		hctl.keysize   = sizeof(ItemPointerData);
-		hctl.entrysize = sizeof(AcornSeenEntry);
-		so->seen = hash_create("acorn_seen", 64, &hctl,
-							   HASH_ELEM | HASH_BLOBS);
-
-		so->tids  = palloc(sizeof(ItemPointerData) * so->ef);
-		st.ef_search = so->ef;
-		st.k         = so->ef;
-		st.predicate = NULL;
-		st.econtext  = NULL;
-		so->count = acorn_scan_execute(&st, scan->indexRelation, NULL,
-									   so->query, scan->xs_snapshot, so->tids);
-		so->pos   = 0;
+		so->stream = acorn_stream_begin(scan->indexRelation, so->query,
+										scan->xs_snapshot, so->tmpCtx);
 		so->first = false;
 
 		MemoryContextSwitchTo(oldCtx);
 	}
 
-	for (;;)
 	{
-		/* Return the next TID that has not been returned before */
-		while (so->pos < so->count)
-		{
-			ItemPointerData tid = so->tids[so->pos++];
-			bool			found;
+		ItemPointerData tid;
 
-			hash_search(so->seen, &tid, HASH_FIND, &found);
-			if (!found)
-			{
-				hash_search(so->seen, &tid, HASH_ENTER, &found);
-				scan->xs_heaptid        = tid;
-				scan->xs_recheck        = false;
-				scan->xs_recheckorderby = false;
-				return true;
-			}
-		}
-
-		/* Buffer exhausted: try expanding ef */
-		if (so->done || so->ef >= ACORN_EF_SEARCH_MAX)
+		if (!acorn_stream_next(so->stream, &tid))
 			return false;
 
-		{
-			MemoryContext	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
-			AcornScanState	st;
-			bool			any_new = false;
-
-			so->ef    = Min(so->ef * 2, ACORN_EF_SEARCH_MAX);
-			so->tids  = repalloc(so->tids, sizeof(ItemPointerData) * so->ef);
-
-			st.ef_search = so->ef;
-			st.k         = so->ef;
-			st.predicate = NULL;
-			st.econtext  = NULL;
-			so->count = acorn_scan_execute(&st, scan->indexRelation, NULL,
-										   so->query, scan->xs_snapshot,
-										   so->tids);
-			so->pos = 0;
-
-			/* Check if expansion produced at least one TID we haven't seen */
-			for (int i = 0; i < so->count; i++)
-			{
-				bool found;
-				hash_search(so->seen, &so->tids[i], HASH_FIND, &found);
-				if (!found)
-				{
-					any_new = true;
-					break;
-				}
-			}
-
-			if (!any_new)
-				so->done = true;
-
-			MemoryContextSwitchTo(oldCtx);
-		}
+		scan->xs_heaptid        = tid;
+		scan->xs_recheck        = false;
+		scan->xs_recheckorderby = false;
+		return true;
 	}
 }
 

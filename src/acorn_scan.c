@@ -571,3 +571,233 @@ acorn_scan_execute(AcornScanState *state, Relation index, Relation heap,
 							   state->k, state->ef_search,
 							   result_tids_out);
 }
+
+/* -----------------------------------------------------------------------
+ * Resumable (streaming) scan — Tier 2
+ *
+ * Maintains a persistent frontier across calls:
+ *   C — candidates awaiting expansion (min-heap, nearest first)
+ *   R — discovered live nodes awaiting emission (min-heap, nearest first)
+ *   visited — index TIDs already discovered (dedup)
+ *
+ * Each node is added to C and R exactly once (guarded by `visited`), expanded
+ * at most once (popped from C), and emitted at most once (popped from R).  The
+ * executor post-filters, so no predicate is evaluated here.
+ * ----------------------------------------------------------------------- */
+
+struct AcornStreamScan
+{
+	Relation		index;
+	FmgrInfo		dist_proc;
+	Datum			query;
+	int				m;
+	pairingheap	   *C;			/* candidates to expand */
+	pairingheap	   *R;			/* discovered, awaiting emission */
+	HTAB		   *visited;
+	MemoryContext	mcxt;
+	bool			exhausted;
+};
+
+/* Expand one candidate: add its unvisited layer-0 neighbors to C and (if live) R. */
+static void
+acorn_stream_expand(AcornStreamScan *s, const AcornElem *ce)
+{
+	ItemPointerData neighbors[HNSW_MAX_NEIGHBORS];
+	ItemPointerData ce_heaptid;
+	int				ce_level;
+	bool			ce_deleted;
+	BlockNumber		nbr_blkno;
+	OffsetNumber	nbr_offno;
+	Buffer			ebuf;
+	int				n_count;
+
+	/* Load the candidate's level + neighbor-tuple location */
+	ebuf = acorn_load_element(s->index,
+							  ItemPointerGetBlockNumber(&ce->indextid),
+							  ItemPointerGetOffsetNumber(&ce->indextid),
+							  &ce_heaptid, &ce_level, &ce_deleted,
+							  &nbr_blkno, &nbr_offno);
+	UnlockReleaseBuffer(ebuf);
+
+	n_count = acorn_get_neighbors(s->index, nbr_blkno, nbr_offno,
+								  ce_level, 0, s->m, neighbors,
+								  HNSW_MAX_NEIGHBORS);
+
+	for (int i = 0; i < n_count; i++)
+	{
+		BlockNumber		nblkno;
+		OffsetNumber	noffno;
+		double			nd;
+		ItemPointerData nheaptid;
+		int				nlevel;
+		bool			ndeleted;
+		BlockNumber		n_nbr_blkno;
+		OffsetNumber	n_nbr_offno;
+		Buffer			nbuf;
+		AcornPQNode	   *cn;
+
+		if (!ItemPointerIsValid(&neighbors[i]))
+			continue;
+		if (is_visited(s->visited, &neighbors[i]))
+			continue;
+		mark_visited(s->visited, &neighbors[i]);
+
+		nblkno = ItemPointerGetBlockNumber(&neighbors[i]);
+		noffno = ItemPointerGetOffsetNumber(&neighbors[i]);
+		nd     = acorn_distance(s->index, nblkno, noffno, s->query, &s->dist_proc);
+
+		/* Always a candidate for expansion (preserve connectivity) */
+		cn = palloc(sizeof(AcornPQNode));
+		ItemPointerCopy(&neighbors[i], &cn->elem.indextid);
+		ItemPointerSetInvalid(&cn->elem.heaptid);
+		cn->elem.distance = nd;
+		pairingheap_add(s->C, &cn->ph_node);
+
+		/* Emit only live nodes — load heaptid + deleted flag */
+		nbuf = acorn_load_element(s->index, nblkno, noffno,
+								  &nheaptid, &nlevel, &ndeleted,
+								  &n_nbr_blkno, &n_nbr_offno);
+		UnlockReleaseBuffer(nbuf);
+
+		if (!ndeleted)
+		{
+			AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+			ItemPointerCopy(&neighbors[i], &rn->elem.indextid);
+			ItemPointerCopy(&nheaptid, &rn->elem.heaptid);
+			rn->elem.distance = nd;
+			pairingheap_add(s->R, &rn->ph_node);
+		}
+	}
+}
+
+AcornStreamScan *
+acorn_stream_begin(Relation index, Datum query, Snapshot snapshot,
+				   MemoryContext mcxt)
+{
+	MemoryContext	old = MemoryContextSwitchTo(mcxt);
+	AcornStreamScan *s  = palloc0(sizeof(AcornStreamScan));
+	BlockNumber		entry_blkno;
+	OffsetNumber	entry_offno;
+	int				entry_level;
+	int				m;
+	HASHCTL			info;
+
+	(void) snapshot;				/* visibility handled by executor post-fetch */
+
+	s->index     = index;
+	s->query     = query;
+	s->mcxt      = mcxt;
+	s->exhausted = false;
+	acorn_load_dist_proc(index, &s->dist_proc);
+
+	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m))
+	{
+		s->exhausted = true;		/* empty index */
+		MemoryContextSwitchTo(old);
+		return s;
+	}
+	s->m = m;
+
+	/* Descend upper layers to the base-layer entry point */
+	if (entry_level > 0)
+		acorn_greedy_descent(index, m, &entry_blkno, &entry_offno,
+							 entry_level, 0, query, &s->dist_proc);
+
+	s->C = pairingheap_allocate(pq_cmp_min, NULL);
+	s->R = pairingheap_allocate(pq_cmp_min, NULL);
+
+	/* visited set anchored to mcxt so it is freed with the scan */
+	memset(&info, 0, sizeof(info));
+	info.keysize   = sizeof(ItemPointerData);
+	info.entrysize = sizeof(VisitedEntry);
+	info.hcxt      = mcxt;
+	s->visited = hash_create("acorn_stream_visited", 512, &info,
+							 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/* Seed the frontier with the base-layer entry point */
+	{
+		ItemPointerData entry_tid;
+		ItemPointerData heaptid;
+		int				lvl;
+		bool			deleted;
+		BlockNumber		nb;
+		OffsetNumber	no;
+		Buffer			eb;
+		double			d;
+		AcornPQNode	   *cn;
+
+		ItemPointerSet(&entry_tid, entry_blkno, entry_offno);
+		mark_visited(s->visited, &entry_tid);
+
+		d  = acorn_distance(index, entry_blkno, entry_offno, query, &s->dist_proc);
+		eb = acorn_load_element(index, entry_blkno, entry_offno,
+								&heaptid, &lvl, &deleted, &nb, &no);
+		UnlockReleaseBuffer(eb);
+
+		cn = palloc(sizeof(AcornPQNode));
+		ItemPointerCopy(&entry_tid, &cn->elem.indextid);
+		ItemPointerSetInvalid(&cn->elem.heaptid);
+		cn->elem.distance = d;
+		pairingheap_add(s->C, &cn->ph_node);
+
+		if (!deleted)
+		{
+			AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+			ItemPointerCopy(&entry_tid, &rn->elem.indextid);
+			ItemPointerCopy(&heaptid, &rn->elem.heaptid);
+			rn->elem.distance = d;
+			pairingheap_add(s->R, &rn->ph_node);
+		}
+	}
+
+	MemoryContextSwitchTo(old);
+	return s;
+}
+
+bool
+acorn_stream_next(AcornStreamScan *s, ItemPointerData *heaptid_out)
+{
+	MemoryContext old;
+
+	if (s->exhausted)
+		return false;
+
+	old = MemoryContextSwitchTo(s->mcxt);
+
+	for (;;)
+	{
+		double r_dist = pairingheap_is_empty(s->R) ? DBL_MAX
+			: ((AcornPQNode *) pairingheap_first(s->R))->elem.distance;
+		double c_dist = pairingheap_is_empty(s->C) ? DBL_MAX
+			: ((AcornPQNode *) pairingheap_first(s->C))->elem.distance;
+
+		/*
+		 * While the nearest unexpanded candidate could be closer than (or tie)
+		 * the nearest discovered result, expand it first — the standard
+		 * streaming-HNSW emission-safety condition.
+		 */
+		if (!pairingheap_is_empty(s->C) && c_dist <= r_dist)
+		{
+			AcornPQNode *cn = (AcornPQNode *) pairingheap_remove_first(s->C);
+			AcornElem	 ce = cn->elem;
+			pfree(cn);
+			acorn_stream_expand(s, &ce);
+			continue;
+		}
+
+		if (pairingheap_is_empty(s->R))
+		{
+			s->exhausted = true;		/* graph fully streamed */
+			MemoryContextSwitchTo(old);
+			return false;
+		}
+
+		{
+			AcornPQNode *rn = (AcornPQNode *) pairingheap_remove_first(s->R);
+			*heaptid_out = rn->elem.heaptid;
+			pfree(rn);
+			MemoryContextSwitchTo(old);
+			return true;
+		}
+	}
+}

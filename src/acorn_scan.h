@@ -35,4 +35,26 @@ int acorn_scan_execute(AcornScanState *state,
 					   Snapshot snapshot,
 					   ItemPointerData *result_tids_out);
 
+/*
+ * Resumable (streaming) scan — Tier 2 only.
+ *
+ * Unlike acorn_scan_execute (which rebuilds the whole traversal on every call),
+ * this keeps a persistent frontier and emits heap TIDs one at a time in
+ * approximate nearest-first order, expanding the graph lazily.  Each graph node
+ * is expanded and emitted at most once, so pulling more results never re-runs
+ * the traversal from the entry point — eliminating the O(ef) re-traversal cost
+ * the ef-doubling batch loop paid at low selectivity.  The executor post-filters
+ * and keeps pulling until its LIMIT is satisfied or the graph is exhausted.
+ *
+ * All state lives in `mcxt`; resetting/deleting that context frees the scan.
+ */
+typedef struct AcornStreamScan AcornStreamScan;
+
+AcornStreamScan *acorn_stream_begin(Relation index,
+									Datum query_vec,
+									Snapshot snapshot,
+									MemoryContext mcxt);
+
+bool acorn_stream_next(AcornStreamScan *stream, ItemPointerData *heaptid_out);
+
 #endif /* ACORN_SCAN_H */
