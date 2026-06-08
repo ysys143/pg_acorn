@@ -239,7 +239,7 @@ acorn_hnsw_handler(PG_FUNCTION_ARGS)
 	amroutine->amcanorderbyop = true;
 	amroutine->amcanbackward = false;
 	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = false;
+	amroutine->amcanmulticol = true;	/* (vector ORDER BY, scalar filter) */
 	amroutine->amoptionalkey = true;
 	amroutine->amsearcharray = false;
 	amroutine->amsearchnulls = false;
