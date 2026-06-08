@@ -16,3 +16,11 @@ build/
 
 # large benchmark datasets (SIFT1M etc.) — never commit
 bench/fixtures/data/
+
+# PostgreSQL extension build artifacts
+*.o
+*.bc
+*.so
+test/results/
+test/regression.out
+test/regression.diffs
