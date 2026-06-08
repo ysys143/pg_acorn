@@ -440,6 +440,587 @@ build_mark_visited(HTAB *visited, const ItemPointerData *tid)
 }
 
 /* -----------------------------------------------------------------------
+ * In-memory node representation for scalable bulk build (work item D)
+ *
+ * The entire HNSW graph is constructed in memory using integer node IDs,
+ * eliminating per-insert random disk I/O.  After construction, a two-pass
+ * flush writes all tuples sequentially:
+ *
+ *   Pass 1: write neighbor tuples (TID slots left invalid)
+ *   Pass 2: write element tuples  (neighbortid filled from pre-assign)
+ *   Pass 3: patch neighbor tuples with element TIDs
+ *
+ * A page-packing simulation (acorn_mem_preassign_tids) assigns every tuple's
+ * on-disk location before any write, breaking the circular TID dependency.
+ * ----------------------------------------------------------------------- */
+
+typedef struct AcornMemNode
+{
+	int				 level;
+	int64			 filter_val;
+	Datum			 vec;			/* palloc'd copy in build_ctx */
+	Size			 vsize;
+	int				*nbr;			/* flat (level+2)*m_eff int IDs; -1=empty */
+	ItemPointerData  heaptid;
+	BlockNumber		 nbr_blkno;		/* assigned by acorn_mem_preassign_tids */
+	OffsetNumber	 nbr_offno;
+	BlockNumber		 elem_blkno;
+	OffsetNumber	 elem_offno;
+} AcornMemNode;
+
+typedef struct AcornMemBuild
+{
+	AcornMemNode   *nodes;
+	int				n_nodes;
+	int				capacity;
+	int				entry_id;		/* -1 = no entry yet */
+	int				entry_level;
+	uint32		   *visit_gen;		/* size = capacity; generation-based visited set */
+	uint32			cur_gen;
+	MemoryContext	build_ctx;
+} AcornMemBuild;
+
+/* Min/max-heap comparators for in-memory beam search (integer node IDs) */
+typedef struct MemPQNode
+{
+	pairingheap_node ph;
+	int				 id;
+	double			 dist;
+} MemPQNode;
+
+static int
+mem_cmp_max(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+{
+	double da = ((const MemPQNode *) a)->dist;
+	double db = ((const MemPQNode *) b)->dist;
+	return (da > db) ? 1 : (da < db) ? -1 : 0;
+}
+
+static int
+mem_cmp_min(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+{
+	return -mem_cmp_max(a, b, arg);
+}
+
+static AcornMemBuild *
+acorn_mem_build_init(MemoryContext ctx)
+{
+	MemoryContext  old = MemoryContextSwitchTo(ctx);
+	AcornMemBuild *mb  = palloc0(sizeof(AcornMemBuild));
+
+	mb->capacity    = 1024;
+	mb->nodes       = palloc0(mb->capacity * sizeof(AcornMemNode));
+	mb->visit_gen   = palloc0(mb->capacity * sizeof(uint32));
+	mb->entry_id    = -1;
+	mb->entry_level = -1;
+	mb->cur_gen     = 1;
+	mb->build_ctx   = ctx;
+	MemoryContextSwitchTo(old);
+	return mb;
+}
+
+static void
+acorn_mem_push_node(AcornMemBuild *mb, Datum vec, Size vsize,
+					int64 filter_val, ItemPointer heaptid)
+{
+	MemoryContext  old  = MemoryContextSwitchTo(mb->build_ctx);
+	AcornMemNode  *node;
+
+	if (mb->n_nodes >= mb->capacity)
+	{
+		int old_cap   = mb->capacity;
+		mb->capacity *= 2;
+		mb->nodes     = repalloc(mb->nodes,
+								  mb->capacity * sizeof(AcornMemNode));
+		mb->visit_gen = repalloc(mb->visit_gen,
+								  mb->capacity * sizeof(uint32));
+		memset(mb->visit_gen + old_cap, 0,
+			   (mb->capacity - old_cap) * sizeof(uint32));
+	}
+
+	node             = &mb->nodes[mb->n_nodes];
+	node->level      = -1;
+	node->filter_val = filter_val;
+	node->vsize      = vsize;
+	node->vec        = PointerGetDatum(
+						   memcpy(palloc(vsize), DatumGetPointer(vec), vsize));
+	node->nbr        = NULL;
+	node->heaptid    = *heaptid;
+	node->nbr_blkno  = InvalidBlockNumber;
+	node->nbr_offno  = InvalidOffsetNumber;
+	node->elem_blkno = InvalidBlockNumber;
+	node->elem_offno = InvalidOffsetNumber;
+
+	mb->n_nodes++;
+	MemoryContextSwitchTo(old);
+}
+
+/* In-memory greedy descent from from_level down to to_level+1 */
+static void
+acorn_mem_greedy_descend(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
+						  int *ep_id, Datum query,
+						  int from_level, int to_level)
+{
+	for (int lc = from_level; lc > to_level; lc--)
+	{
+		bool improved;
+
+		do {
+			int           cur      = *ep_id;
+			AcornMemNode *node     = &mb->nodes[cur];
+			double        cur_dist = acorn_dist(proc, node->vec, query);
+			int           start    = HnswNeighborStart(m_eff, node->level, lc);
+			int           layer_m  = HnswGetLayerM(m_eff, lc);
+
+			improved = false;
+			for (int j = 0; j < layer_m; j++)
+			{
+				int    nbr_id = node->nbr[start + j];
+				double nd;
+
+				if (nbr_id < 0)
+					break;
+				nd = acorn_dist(proc, mb->nodes[nbr_id].vec, query);
+				if (nd < cur_dist)
+				{
+					cur_dist = nd;
+					*ep_id   = nbr_id;
+					improved = true;
+				}
+			}
+		} while (improved);
+	}
+}
+
+/*
+ * In-memory beam search at `layer` with ef candidates.
+ * Returns up to ef results in out_ids[]/out_dists[], nearest-first.
+ */
+static int
+acorn_mem_search_layer(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
+					   int entry_id, Datum query, int layer, int ef,
+					   int *out_ids, double *out_dists)
+{
+	MemoryContext  tmp_ctx, old_ctx;
+	pairingheap   *C, *W;
+	int			   W_count = 0;
+	int			   n_out;
+
+	tmp_ctx = AllocSetContextCreate(mb->build_ctx, "acorn_mem_search",
+									ALLOCSET_SMALL_SIZES);
+	old_ctx = MemoryContextSwitchTo(tmp_ctx);
+
+	mb->cur_gen++;
+	C = pairingheap_allocate(mem_cmp_min, NULL);
+	W = pairingheap_allocate(mem_cmp_max, NULL);
+
+	/* Seed with entry_id */
+	{
+		double    ep_dist = acorn_dist(proc, mb->nodes[entry_id].vec, query);
+		MemPQNode *cn, *wn;
+
+		mb->visit_gen[entry_id] = mb->cur_gen;
+		cn = palloc(sizeof(MemPQNode)); cn->id = entry_id; cn->dist = ep_dist;
+		pairingheap_add(C, &cn->ph);
+		wn = palloc(sizeof(MemPQNode)); wn->id = entry_id; wn->dist = ep_dist;
+		pairingheap_add(W, &wn->ph);
+		W_count = 1;
+	}
+
+	while (!pairingheap_is_empty(C))
+	{
+		MemPQNode    *c_node = (MemPQNode *) pairingheap_remove_first(C);
+		int			  c_id   = c_node->id;
+		double		  c_dist = c_node->dist;
+		AcornMemNode *c_data = &mb->nodes[c_id];
+		double		  f_dist;
+		int			  start, layer_m;
+
+		f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
+		if (c_dist > f_dist && W_count >= ef)
+			break;
+
+		if (c_data->level < layer)
+			continue;	/* safety: node doesn't appear at this layer */
+
+		start   = HnswNeighborStart(m_eff, c_data->level, layer);
+		layer_m = HnswGetLayerM(m_eff, layer);
+
+		for (int j = 0; j < layer_m; j++)
+		{
+			int    nbr_id = c_data->nbr[start + j];
+			double nd;
+
+			if (nbr_id < 0)
+				break;
+			if (mb->visit_gen[nbr_id] == mb->cur_gen)
+				continue;
+			if (mb->nodes[nbr_id].level < layer)
+				continue;
+			mb->visit_gen[nbr_id] = mb->cur_gen;
+
+			nd     = acorn_dist(proc, mb->nodes[nbr_id].vec, query);
+			f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
+
+			if (nd < f_dist || W_count < ef)
+			{
+				MemPQNode *cn, *wn;
+
+				cn = palloc(sizeof(MemPQNode)); cn->id = nbr_id; cn->dist = nd;
+				pairingheap_add(C, &cn->ph);
+				wn = palloc(sizeof(MemPQNode)); wn->id = nbr_id; wn->dist = nd;
+				pairingheap_add(W, &wn->ph);
+				W_count++;
+
+				if (W_count > ef)
+				{
+					(void) pairingheap_remove_first(W);
+					W_count--;
+				}
+			}
+		}
+	}
+
+	/* Extract W nearest-first */
+	n_out = W_count;
+	for (int i = W_count - 1; i >= 0; i--)
+	{
+		MemPQNode *wn  = (MemPQNode *) pairingheap_remove_first(W);
+		out_ids[i]   = wn->id;
+		out_dists[i] = wn->dist;
+	}
+
+	MemoryContextSwitchTo(old_ctx);
+	MemoryContextDelete(tmp_ctx);
+	return n_out;
+}
+
+/*
+ * In-memory HNSW insert for node new_id.
+ * Assigns level, allocates nbr array, runs greedy descent + beam search,
+ * fills neighbor IDs, and writes reverse edges with fixed-slot retry.
+ */
+static void
+acorn_mem_insert_node(AcornMemBuild *mb, FmgrInfo *proc, int m_eff, int efc,
+					  unsigned short rand_state[3], int new_id)
+{
+	AcornMemNode *node    = &mb->nodes[new_id];
+	int			  level   = acorn_assign_level(m_eff, rand_state);
+	int			  n_slots = (level + 2) * m_eff;
+	int			 *out_ids;
+	double		 *out_dists;
+	int			  ep_id;
+
+	node->level = level;
+	node->nbr   = (int *) MemoryContextAlloc(mb->build_ctx,
+											   n_slots * sizeof(int));
+	for (int k = 0; k < n_slots; k++)
+		node->nbr[k] = -1;
+
+	if (mb->entry_id < 0)
+	{
+		mb->entry_id    = new_id;
+		mb->entry_level = level;
+		return;
+	}
+
+	ep_id = mb->entry_id;
+
+	if (mb->entry_level > level)
+		acorn_mem_greedy_descend(mb, proc, m_eff, &ep_id,
+								  node->vec, mb->entry_level, level);
+
+	out_ids   = palloc(sizeof(int)    * efc);
+	out_dists = palloc(sizeof(double) * efc);
+
+	for (int lc = Min(mb->entry_level, level); lc >= 0; lc--)
+	{
+		int layer_m = HnswGetLayerM(m_eff, lc);
+		int start   = HnswNeighborStart(m_eff, level, lc);
+		int n_cands = acorn_mem_search_layer(mb, proc, m_eff,
+											  ep_id, node->vec, lc, efc,
+											  out_ids, out_dists);
+
+		for (int i = 0; i < Min(n_cands, layer_m); i++)
+			node->nbr[start + i] = out_ids[i];
+
+		if (n_cands > 0)
+			ep_id = out_ids[0];
+
+		/* Reverse edges with fixed-slot retry */
+		for (int i = 0; i < Min(n_cands, layer_m); i++)
+		{
+			int           nbr_id    = out_ids[i];
+			AcornMemNode *nbr_node  = &mb->nodes[nbr_id];
+			int           nbr_lm    = HnswGetLayerM(m_eff, lc);
+			int           nbr_start = HnswNeighborStart(m_eff, nbr_node->level, lc);
+			int           slot      = -1;
+			int           len;
+
+			for (len = 0; len < nbr_lm; len++)
+			{
+				if (nbr_node->nbr[nbr_start + len] < 0)
+					break;
+				if (nbr_node->nbr[nbr_start + len] == new_id)
+				{
+					slot = -2;	/* already connected */
+					break;
+				}
+			}
+			if (slot == -2)
+				continue;
+
+			if (len < nbr_lm)
+			{
+				slot = len;
+			}
+			else
+			{
+				double d_new = acorn_dist(proc, nbr_node->vec, node->vec);
+				double furthest_d = -DBL_MAX;
+				int    furthest_j = -1;
+
+				for (int j = 0; j < nbr_lm; j++)
+				{
+					int    eid = nbr_node->nbr[nbr_start + j];
+					double d   = acorn_dist(proc, nbr_node->vec,
+											 mb->nodes[eid].vec);
+
+					if (d > furthest_d)
+					{
+						furthest_d = d;
+						furthest_j = j;
+					}
+				}
+				if (d_new < furthest_d)
+					slot = furthest_j;
+			}
+
+			if (slot >= 0)
+				nbr_node->nbr[nbr_start + slot] = new_id;
+		}
+	}
+
+	pfree(out_ids);
+	pfree(out_dists);
+
+	if (level > mb->entry_level)
+	{
+		mb->entry_level = level;
+		mb->entry_id    = new_id;
+	}
+}
+
+/* Run in-memory HNSW construction for all collected nodes. */
+static void
+acorn_mem_build_graph(AcornMemBuild *mb, Relation index,
+					  unsigned short rand_state[3])
+{
+	int      m_eff = acorn_m_eff(index);
+	int      efc   = acorn_opt_ef_construction(index);
+	FmgrInfo *proc = acorn_dist_proc(index);
+
+	for (int i = 0; i < mb->n_nodes; i++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		acorn_mem_insert_node(mb, proc, m_eff, efc, rand_state, i);
+	}
+}
+
+/* -----------------------------------------------------------------------
+ * TID pre-assignment: simulate page packing without touching disk.
+ * Must exactly mirror acorn_append_tuple's page-selection logic.
+ * ----------------------------------------------------------------------- */
+
+#define SIM_PAGE_LOWER_INIT  ((int) SizeOfPageHeaderData)
+#define SIM_PAGE_UPPER_INIT  ((int) (BLCKSZ - MAXALIGN(sizeof(HnswPageOpaqueData))))
+
+typedef struct SimPage
+{
+	BlockNumber blkno;
+	int			pd_lower;
+	int			pd_upper;
+	int			nitems;
+} SimPage;
+
+static void
+sim_page_init(SimPage *sp)
+{
+	sp->blkno    = 1;				/* block 0 = meta */
+	sp->pd_lower = SIM_PAGE_LOWER_INIT;
+	sp->pd_upper = SIM_PAGE_UPPER_INIT;
+	sp->nitems   = 0;
+}
+
+/* True if an item of `size` (already MAXALIGN'd) fits on the current page. */
+static bool
+sim_page_fits(const SimPage *sp, Size size)
+{
+	int free_space = sp->pd_upper - sp->pd_lower - (int) sizeof(ItemIdData);
+	return free_space >= (int) size;
+}
+
+static OffsetNumber
+sim_page_alloc(SimPage *sp, Size size)
+{
+	sp->pd_lower += (int) sizeof(ItemIdData);
+	sp->pd_upper -= (int) size;
+	sp->nitems++;
+	return (OffsetNumber) sp->nitems;
+}
+
+static void
+sim_page_advance(SimPage *sp)
+{
+	sp->blkno++;
+	sp->pd_lower = SIM_PAGE_LOWER_INIT;
+	sp->pd_upper = SIM_PAGE_UPPER_INIT;
+	sp->nitems   = 0;
+}
+
+/*
+ * Pre-assign on-disk locations for all node tuples.
+ * Simulates the two-pass write order: all neighbor tuples first, then all
+ * element tuples, in the same sequential page stream.
+ */
+static void
+acorn_mem_preassign_tids(AcornMemBuild *mb, int m_eff)
+{
+	SimPage sp;
+
+	sim_page_init(&sp);
+
+	/* Pass 1: neighbor tuples */
+	for (int i = 0; i < mb->n_nodes; i++)
+	{
+		AcornMemNode *node    = &mb->nodes[i];
+		Size          ntup_sz = HNSW_NEIGHBOR_TUPLE_SIZE(node->level, m_eff);
+
+		if (!sim_page_fits(&sp, ntup_sz))
+			sim_page_advance(&sp);
+		node->nbr_blkno = sp.blkno;
+		node->nbr_offno = sim_page_alloc(&sp, ntup_sz);
+	}
+
+	/* Pass 2: element tuples (page stream continues from pass 1) */
+	for (int i = 0; i < mb->n_nodes; i++)
+	{
+		AcornMemNode *node    = &mb->nodes[i];
+		Size          etup_sz = ACORN_T2_ELEMENT_TUPLE_SIZE(node->vsize);
+
+		if (!sim_page_fits(&sp, etup_sz))
+			sim_page_advance(&sp);
+		node->elem_blkno = sp.blkno;
+		node->elem_offno = sim_page_alloc(&sp, etup_sz);
+	}
+}
+
+/*
+ * Flush in-memory graph to disk.
+ *
+ * Pass 1: write neighbor tuples (TID slots all invalid — patched in pass 3).
+ * Pass 2: write element tuples  (neighbortid valid from pre-assign).
+ * Pass 3: patch neighbor TID slots with element TIDs.
+ * Then update meta entry point.
+ */
+static void
+acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff)
+{
+	BlockNumber  blkno_out;
+	OffsetNumber off_out;
+
+	if (mb->n_nodes == 0)
+		return;
+
+	acorn_mem_preassign_tids(mb, m_eff);
+
+	/* Pass 1: write all neighbor tuples */
+	for (int i = 0; i < mb->n_nodes; i++)
+	{
+		AcornMemNode     *node    = &mb->nodes[i];
+		Size              ntup_sz = HNSW_NEIGHBOR_TUPLE_SIZE(node->level, m_eff);
+		HnswNeighborTuple ntup    = palloc0(ntup_sz);
+
+		ntup->type    = HNSW_NEIGHBOR_TUPLE_TYPE;
+		ntup->version = HNSW_VERSION;
+		ntup->count   = (uint16) ((node->level + 2) * m_eff);
+
+		acorn_append_tuple(index, forkNum, (Item) ntup, ntup_sz,
+						   &blkno_out, &off_out);
+		Assert(blkno_out == node->nbr_blkno && off_out == node->nbr_offno);
+		pfree(ntup);
+	}
+
+	/* Pass 2: write all element tuples */
+	for (int i = 0; i < mb->n_nodes; i++)
+	{
+		AcornMemNode       *node    = &mb->nodes[i];
+		Size                etup_sz = ACORN_T2_ELEMENT_TUPLE_SIZE(node->vsize);
+		AcornT2ElementTuple etup    = palloc0(etup_sz);
+
+		etup->type    = HNSW_ELEMENT_TUPLE_TYPE;
+		etup->level   = (uint8) node->level;
+		etup->version = HNSW_VERSION;
+		for (int k = 0; k < HNSW_HEAPTIDS; k++)
+			ItemPointerSetInvalid(&etup->heaptids[k]);
+		etup->heaptids[0] = node->heaptid;
+		ItemPointerSet(&etup->neighbortid, node->nbr_blkno, node->nbr_offno);
+		etup->filter_val  = node->filter_val;
+		memcpy(AcornT2ElementTupleGetVector(etup),
+			   DatumGetPointer(node->vec), node->vsize);
+
+		acorn_append_tuple(index, forkNum, (Item) etup, etup_sz,
+						   &blkno_out, &off_out);
+		Assert(blkno_out == node->elem_blkno && off_out == node->elem_offno);
+		pfree(etup);
+	}
+
+	/* Pass 3: patch neighbor TID slots with element TIDs */
+	for (int i = 0; i < mb->n_nodes; i++)
+	{
+		AcornMemNode *node = &mb->nodes[i];
+
+		for (int lc = node->level; lc >= 0; lc--)
+		{
+			int start   = HnswNeighborStart(m_eff, node->level, lc);
+			int layer_m = HnswGetLayerM(m_eff, lc);
+
+			for (int j = 0; j < layer_m; j++)
+			{
+				int               nbr_id = node->nbr[start + j];
+				Buffer            buf;
+				Page              page;
+				HnswNeighborTuple ntup;
+
+				if (nbr_id < 0)
+					break;
+
+				buf  = ReadBufferExtended(index, forkNum,
+										  node->nbr_blkno, RBM_NORMAL, NULL);
+				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+				page = BufferGetPage(buf);
+				ntup = (HnswNeighborTuple)
+					PageGetItem(page, PageGetItemId(page, node->nbr_offno));
+				ItemPointerSet(
+					&HnswNeighborTupleGetTids(ntup)[start + j],
+					mb->nodes[nbr_id].elem_blkno,
+					mb->nodes[nbr_id].elem_offno);
+				MarkBufferDirty(buf);
+				UnlockReleaseBuffer(buf);
+			}
+		}
+	}
+
+	/* Update meta entry point */
+	if (mb->entry_id >= 0)
+	{
+		AcornMemNode *ep = &mb->nodes[mb->entry_id];
+		acorn_maybe_update_entry(index, ep->elem_blkno, ep->elem_offno,
+								  ep->level);
+	}
+}
+
+/* -----------------------------------------------------------------------
  * Greedy descent for build (ef=1 upper-layer traversal)
  * ----------------------------------------------------------------------- */
 
@@ -932,11 +1513,11 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 
 typedef struct AcornBuildState
 {
-	ForkNumber		forkNum;
-	double			ntuples;
-	MemoryContext	tmpCtx;
-	unsigned short	rand_state[3];	/* pg_erand48 state for level assignment */
-	bool			has_filter;		/* true if index has a scalar filter column */
+	ForkNumber		 forkNum;
+	double			 ntuples;
+	unsigned short	 rand_state[3];	/* pg_erand48 state for level assignment */
+	bool			 has_filter;	/* true if index has a scalar filter column */
+	AcornMemBuild	*mb;			/* in-memory graph accumulator */
 } AcornBuildState;
 
 static void
@@ -944,24 +1525,25 @@ acorn_build_callback(Relation index, ItemPointer tid, Datum *values,
 					 bool *isnull, bool tupleIsAlive, void *state)
 {
 	AcornBuildState *bs = (AcornBuildState *) state;
-	MemoryContext	 oldCtx;
-	Datum			 value;
 	int64			 filter_val = 0;
+	Datum			 detoasted;
+	void			*raw;
+	Size			 vsize;
 
 	if (isnull[0])
 		return;
 
-	oldCtx = MemoryContextSwitchTo(bs->tmpCtx);
-
 	if (bs->has_filter && !isnull[1])
 		filter_val = (int64) values[1];
 
-	value = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
-	acorn_insert_element(index, bs->forkNum, value, filter_val, tid, bs->rand_state);
+	detoasted = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
+	raw       = DatumGetPointer(detoasted);
+	vsize     = VARSIZE_ANY(raw);
+	acorn_mem_push_node(bs->mb, detoasted, vsize, filter_val, tid);
 	bs->ntuples += 1;
 
-	MemoryContextSwitchTo(oldCtx);
-	MemoryContextReset(bs->tmpCtx);
+	if (raw != DatumGetPointer(values[0]))
+		pfree(raw);
 }
 
 static void
@@ -998,22 +1580,28 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 
 	acorn_create_meta_page(index, forkNum, m_eff, efc, dims);
 
-	bs.forkNum       = forkNum;
-	bs.ntuples       = 0;
-	bs.has_filter    = (RelationGetDescr(index)->natts > 1);
-	bs.tmpCtx        = AllocSetContextCreate(CurrentMemoryContext,
-											  "acorn build temp",
-											  ALLOCSET_DEFAULT_SIZES);
-	/* Seed from process ID; gives different level sequences per build */
-	bs.rand_state[0] = (unsigned short) (MyProcPid & 0xFFFF);
-	bs.rand_state[1] = (unsigned short) (MyProcPid >> 16);
-	bs.rand_state[2] = 0x1234;
+	{
+		MemoryContext build_ctx = AllocSetContextCreate(CurrentMemoryContext,
+													    "acorn build",
+													    ALLOCSET_DEFAULT_SIZES);
+		bs.forkNum    = forkNum;
+		bs.ntuples    = 0;
+		bs.has_filter = (RelationGetDescr(index)->natts > 1);
+		/* Seed from process ID; gives different level sequences per build */
+		bs.rand_state[0] = (unsigned short) (MyProcPid & 0xFFFF);
+		bs.rand_state[1] = (unsigned short) (MyProcPid >> 16);
+		bs.rand_state[2] = 0x1234;
+		bs.mb = acorn_mem_build_init(build_ctx);
 
-	if (heap != NULL)
-		reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
-										   acorn_build_callback, (void *) &bs, NULL);
+		if (heap != NULL)
+			reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
+											   acorn_build_callback, (void *) &bs, NULL);
 
-	MemoryContextDelete(bs.tmpCtx);
+		acorn_mem_build_graph(bs.mb, index, bs.rand_state);
+		acorn_mem_flush(bs.mb, index, forkNum, m_eff);
+
+		MemoryContextDelete(build_ctx);
+	}
 
 	if (heap_tuples)
 		*heap_tuples  = reltuples;
