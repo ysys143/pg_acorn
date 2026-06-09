@@ -28,6 +28,7 @@
 #include "acorn_am.h"
 #include "acorn_cost.h"
 #include "acorn_scan.h"
+#include "acorn_t2_page.h"
 
 PG_FUNCTION_INFO_V1(acorn_hnsw_handler);
 
@@ -208,8 +209,83 @@ static IndexBulkDeleteResult *
 acorn_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				 IndexBulkDeleteCallback callback, void *callback_state)
 {
+	BlockNumber nblocks;
+	BlockNumber blkno;
+
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+
+	nblocks = RelationGetNumberOfBlocks(info->index);
+
+	/* Block 0 is the metapage — skip it */
+	for (blkno = 1; blkno < nblocks; blkno++)
+	{
+		Buffer		 buf;
+		Page		 page;
+		OffsetNumber off, maxoff;
+		bool		 page_modified = false;
+
+		CHECK_FOR_INTERRUPTS();
+
+		buf  = ReadBufferExtended(info->index, MAIN_FORKNUM, blkno,
+								  RBM_NORMAL, info->strategy);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+
+		if (!HnswPageIsValid(page))
+		{
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
+		maxoff = PageGetMaxOffsetNumber(page);
+		for (off = FirstOffsetNumber; off <= maxoff; off = OffsetNumberNext(off))
+		{
+			ItemId				iid = PageGetItemId(page, off);
+			AcornT2ElementTuple etup;
+			int					i;
+			bool				any_live;
+
+			if (!ItemIdIsNormal(iid))
+				continue;
+
+			etup = (AcornT2ElementTuple) PageGetItem(page, iid);
+
+			if (etup->type != HNSW_ELEMENT_TUPLE_TYPE)
+				continue;
+
+			if (etup->deleted)
+			{
+				stats->tuples_removed++;
+				continue;
+			}
+
+			/* Element is dead when every valid heaptid passes the callback */
+			any_live = false;
+			for (i = 0; i < HNSW_HEAPTIDS; i++)
+			{
+				if (!ItemPointerIsValid(&etup->heaptids[i]))
+					break;
+				if (!callback(&etup->heaptids[i], callback_state))
+				{
+					any_live = true;
+					break;
+				}
+			}
+
+			if (!any_live)
+			{
+				etup->deleted  = 1;
+				page_modified  = true;
+				stats->tuples_removed++;
+			}
+		}
+
+		if (page_modified)
+			MarkBufferDirty(buf);
+		UnlockReleaseBuffer(buf);
+	}
+
 	return stats;
 }
 
