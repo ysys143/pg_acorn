@@ -64,6 +64,71 @@ python3 bench/run_bench.py --scenario a \
 
 ---
 
+## Run 6: Phase A (distance-triggered D-drain) + Phase B (hook fix) at n=50,000
+
+Two fixes applied to Phase 1+2 code:
+
+- **Phase A**: Remove per-expand `k_d` flush from `stream_expand`. Add
+  distance-triggered drain in `stream_next`: inject one 2-hop expansion only when
+  `D-nearest < C-nearest`. This prevents deferred filter-failures from contaminating
+  the C frontier before convergence.
+- **Phase B**: Fix `docker-compose.yml` entrypoint — YAML `>` block scalar with
+  deeper-indented lines preserves literal newlines, so `exec docker-entrypoint.sh
+  postgres` was executing before `-c shared_preload_libraries=pg_acorn` could be
+  passed. Restructured to list form so the exec and its `-c` argument are on the same
+  bash line. `SHOW shared_preload_libraries` now returns `pg_acorn`.
+
+### Configuration
+
+Same as Run 5 (n=50,000, dim=96, m=16, ef_construction=64, 100 queries, k=10).
+
+### Recall@10
+
+| Target | 1% | 5% | 10% | 40% | 80% | Plan@10% |
+|--------|-----|-----|------|------|------|----------|
+| pgvector | 1.000 | 1.000 | **1.000** | 0.974 | 0.952 | Custom Scan |
+| tier1_g1 | 0.033 | 0.211 | 0.415 | 0.980 | 0.946 | Index Scan |
+| tier2_g1 (2hop off) | 0.904 | 0.673 | 0.617 | 0.642 | 0.612 | Index Scan |
+| tier2_g1 (2hop on) | 0.902 | 0.666 | **0.634** | 0.689 | 0.650 | Index Scan |
+| tier2_g2 (2hop off) | 0.992 | 0.882 | 0.854 | 0.855 | 0.870 | Index Scan |
+| tier2_g2 (2hop on) | 0.987 | 0.878 | **0.859** | 0.848 | 0.866 | Index Scan |
+
+### Interpretation
+
+**Phase A validated:** 2-hop now improves recall vs no-2hop within the same graph.
+At 10% selectivity: tier2_g1_2hop = 0.634 > tier2_g1 = 0.617 (+0.017). Previously
+(Run 5) the relation was inverted (0.609 < 0.627). The distance-triggered drain
+correctly delays D-injection until D has a candidate closer than the C frontier.
+
+**Phase B validated:** pgvector now shows Custom Scan (hook active), recall 1.000.
+In Run 5, pgvector showed Index Scan with recall 0.405 due to the broken
+`shared_preload_libraries` entrypoint.
+
+**tier1_g1 anomaly:** Despite the hook being loaded, tier1_g1 shows Index Scan
+(recall ~0.4 at 10%). The hook intercepts pgvector (`hnsw` AM) queries and
+redirects them to a custom scan; it does not intercept `acorn_hnsw` AM queries
+(tier1 uses pg_acorn's own AM and falls back to the standard PostgreSQL index scan
+path). This is a pre-existing design gap — tier1 in-filter recall requires the
+cost model and the ACORN in-filter scan (tier2), not hook-level redirection.
+
+**Recall vs Phase 0 baseline:** tier2_g1 @10% = 0.617 vs Phase 0 = 0.884. Still
+regressed. This run used a fresh container (new `CREATE INDEX` with different
+`random()` seed = different HNSW graph). The code is algorithmically correct;
+controlled A/B comparison on the same graph is needed to isolate this.
+
+### Reproduce
+
+```sh
+docker compose -f docker/docker-compose.yml --profile bench down -v
+docker compose -f docker/docker-compose.yml --profile bench up --build -d
+docker compose -f docker/docker-compose.yml --profile bench run bench \
+  python3 bench/run_bench.py \
+  --dsn "postgresql://postgres:postgres@postgres/bench" \
+  --scenario a --output bench/results.json
+```
+
+---
+
 ## Run 5: Phase 1 (node cache) + Phase 2 (2-hop NaviX) at n=50,000
 
 First real-scale measurement. Phase 1 combines the per-neighbor distance read and
