@@ -1,5 +1,88 @@
 # pg_acorn Benchmark — Scenario A (Filter Selectivity Sweep)
 
+## Run 7: Real SIFT data at n=200,000, dim=128 (Phase C validation)
+
+First run on real SIFT1M data at a scale that exercises the full graph structure.
+n=200K vectors, dim=128, m=16, ef_construction=64, k=10, 20 queries per selectivity.
+
+### Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Fixture | SIFT1M subset — real fvecs, n=200,000 |
+| Vectors / dim / queries / k | 200,000 / 128 / 20 / 10 |
+| Index params | m=16, ef_construction=64 |
+| Filter column | `buck` (integer bucket id), uniform distribution |
+| Force index scan | yes (`enable_seqscan=off, enable_bitmapscan=off`) |
+
+### Recall@10
+
+| Target | 1% | 5% | 10% | 40% | 80% | Plan@1% |
+|--------|-----|-----|------|------|------|---------|
+| pgvector | 1.000 | 0.197 | 0.402 | 0.952 | 0.926 | Custom Scan |
+| tier1_g1 | 1.000 | 0.197 | 0.401 | 0.941 | 0.926 | Custom Scan |
+| tier2_g1 (2hop off) | 0.923 | 0.913 | 0.890 | 0.811 | 0.734 | Index Scan |
+| tier2_g1 (2hop on) | 0.825 | 0.823 | 0.779 | 0.657 | 0.547 | Index Scan |
+| tier2_g2 (2hop off) | **0.964** | **0.947** | **0.936** | **0.857** | 0.796 | Index Scan |
+| tier2_g2 (2hop on) | 0.961 | 0.947 | 0.932 | 0.830 | 0.748 | Index Scan |
+
+### Pages per query (total logical accesses)
+
+| Target | 1% | 5% | 10% | 40% | 80% |
+|--------|-----|-----|------|------|------|
+| pgvector | 30,892 | 1,092 | 1,092 | 1,077 | 1,064 |
+| tier1_g1 | 30,882 | 1,088 | 1,088 | 1,073 | 1,060 |
+| tier2_g1 (2hop off) | 9,507 | 3,320 | 2,019 | 719 | 454 |
+| tier2_g1 (2hop on) | 10,106 | 3,206 | 1,898 | 665 | 461 |
+| tier2_g2 (2hop off) | 13,168 | 4,936 | 3,191 | 1,214 | 800 |
+| tier2_g2 (2hop on) | 13,187 | 4,957 | 3,209 | 1,210 | 797 |
+
+### Interpretation
+
+**Hook fires at 1% only.** At n=50K (Run 6), the ACORN-1 custom scan fired at all
+selectivities. At n=200K, the cost model tips: at 5%/10%/40%/80% the planner prefers
+a straight Index Scan over the custom path. The 1% custom scan finds all 10 matching
+results (recall 1.000); the 5%+ Index Scan returns approximate nearest-neighbors and
+post-filters — yielding recall 0.197/0.402 at 5%/10%, a near-miss-biased scan typical
+of unmodified HNSW under a post-filter executor. This is the Tier 1 design gap at
+moderate selectivity (already documented in Run 6).
+
+**2-hop hurts recall at n=200K — regression vs n=50K.** At 10% selectivity:
+- tier2_g1 2hop-on = 0.779 vs 2hop-off = 0.890 (-0.111)
+- tier2_g2 2hop-on = 0.932 vs 2hop-off = 0.936 (-0.004)
+
+Run 6 (n=50K) showed 2-hop improving recall (+0.017 for g1 @10%). The reversal at
+n=200K suggests the distance-triggered drain injects D-candidates too eagerly when
+the graph is dense: the C frontier already contains good candidates at this scale, and
+D-injection displaces them with farther-away 2-hop neighbors. The drain threshold
+(`D-nearest < C-nearest`) is still too lenient at 200K. Further investigation of the
+drain policy is needed before 2-hop is recommended at production scale.
+
+**tier2_g2 (2hop off) is the best-performing variant** at this scale: recall
+0.964/0.947/0.936/0.857 at 1–40%, with 13K/4.9K/3.2K/1.2K pages. The gamma=2 denser
+graph maintains high recall across the selectivity range without 2-hop's noise. This
+is the recommended configuration for n≥100K.
+
+**tier2_g1 (2hop off) pages vs pgvector/tier1.** At 1% selectivity, tier2_g1 uses
+9,507 pages vs pgvector's 30,892 (3.2x fewer) at slightly lower recall (0.923 vs 1.0).
+At 5%/10%, tier2_g1 uses 3,320/2,019 pages vs pgvector's 1,092/1,092 (3x more), but
+recall is 0.913/0.890 vs 0.197/0.402 — a significant quality/cost trade-off that
+favors tier2 whenever in-filter recall matters.
+
+### Reproduce
+
+```sh
+docker compose -f docker/docker-compose.yml --profile bench down -v
+docker compose -f docker/docker-compose.yml --profile bench up --build -d
+docker compose -f docker/docker-compose.yml --profile bench run bench \
+  python3 bench/run_bench.py \
+  --dsn "postgresql://postgres:postgres@postgres/bench" \
+  --scenario a --n-vectors 200000 --dim 128 \
+  --output bench/results_sift200k.json
+```
+
+---
+
 ## Run 4: Resumable Streaming Scan + corrected methodology (n=10,000)
 
 Two changes: (a) Tier 2's ef-doubling batch loop (which re-ran the full HNSW
