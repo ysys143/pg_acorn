@@ -1445,6 +1445,13 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 	Size				vsize    = VARSIZE_ANY(DatumGetPointer(value));
 	Size				etupSize = ACORN_T2_ELEMENT_TUPLE_SIZE(vsize);
 
+	if (etupSize > HNSW_MAX_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("acorn_hnsw: vector too large to index"),
+				 errdetail("Element tuple size %zu exceeds page limit %zu. "
+						   "Reduce dimensions.", etupSize, HNSW_MAX_SIZE)));
+
 	int					l_new;
 	Size				ntupSize;
 	HnswNeighborTuple	ntup;
