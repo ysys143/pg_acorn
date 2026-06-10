@@ -67,6 +67,18 @@ ORDER BY embedding <-> '[...]' LIMIT 10;
 - `1` — ACORN-1: search-time neighbor expansion only, no build overhead
 - `2+` — ACORN-gamma: M*gamma neighbors stored at build time, higher recall
 
+`acorn_payload_edges` (bool, default `false`): when on, each node's layer-0
+neighbor slots are split — half global nearest (standard HNSW), half nearest
+among nodes sharing the same payload partition (`hash(filter_val) % 256`,
+identity for small ints).  Same-value edges make the predicate subgraph
+navigable on correlated/low-selectivity filters (Qdrant "Filterable HNSW"
+style) without raising gamma:
+
+```sql
+CREATE INDEX ON items USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+  WITH (m = 16, ef_construction = 64, acorn_payload_edges = true);
+```
+
 ## Installation
 
 ```bash
