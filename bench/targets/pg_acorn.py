@@ -97,7 +97,8 @@ class PgAcornTarget:
             if self.tier == 2:
                 cur.execute(f"SET pg_acorn.ef_search = {ef}")
             else:
-                cur.execute(f"SET hnsw.ef_search = {ef}")
+                # Tier 1 rides pgvector's HNSW, whose ef_search caps at 1000.
+                cur.execute(f"SET hnsw.ef_search = {min(ef, 1000)}")
 
     def insert_batch(self, vectors: np.ndarray, metadata: list[dict]) -> None:
         with self.conn.cursor() as cur:
