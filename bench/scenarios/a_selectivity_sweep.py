@@ -12,7 +12,7 @@ import numpy as np
 
 
 SELECTIVITIES = [1, 5, 10, 40, 80]  # percent — bucket < N gives N% selectivity
-EF_SEARCHES = [10, 40, 100, 200, 400]  # recall/QPS knob swept per selectivity
+EF_SEARCHES = [10, 40, 100, 200, 400, 800, 1600]  # recall/QPS knob swept per selectivity
 K = 10
 N_QUERIES = 100
 N_EXPLAIN = 20  # queries sampled for page-I/O (EXPLAIN BUFFERS), outside timing

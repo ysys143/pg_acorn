@@ -80,7 +80,7 @@ _PG_init(void)
 		&acorn_ef_search,
 		ACORN_DEFAULT_EF_SEARCH,	/* default */
 		1,							/* min */
-		1000,						/* max */
+		4000,						/* max (expansion budget; allows deep sweeps) */
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL
