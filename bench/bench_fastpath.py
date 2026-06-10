@@ -41,7 +41,9 @@ BASELINE_FILE = os.path.join(os.path.dirname(__file__), "results_fastpath_baseli
 # previous config.  Only toggles that exist in this binary are used.
 # scan_prefetch goes LAST: it regresses the warm-cache path (default off),
 # so it must not sit inside the chain and pollute later attributions.
-TOGGLE_ORDER = ["scan_direct_dist", "scan_single_read", "scan_prefetch"]
+TOGGLE_ORDER = ["scan_direct_dist", "scan_single_read",
+                "scan_visited_oneprobe", "scan_direct_filter",
+                "scan_prefetch"]
 
 
 def make_data():
@@ -103,6 +105,112 @@ def exact_truth(vectors, buckets, q):
 
 SQL = (f"SELECT id FROM {TABLE} WHERE bucket < %s "
        f"ORDER BY embedding <=> %s::vector LIMIT %s")
+
+# --- Tier 1 leg: pgvector hnsw index + AcornScan CustomScan hook -----------
+
+T1_TABLE = "fastpath_t1"
+T1_SQL = (f"SELECT id FROM {T1_TABLE} WHERE bucket < %s "
+          f"ORDER BY embedding <=> %s::vector LIMIT %s")
+
+
+def ensure_t1(conn, vectors, buckets):
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM pg_class WHERE relname = %s",
+                    (T1_TABLE + "_idx",))
+        if cur.fetchone()[0]:
+            cur.execute(f"SELECT count(*) FROM {T1_TABLE}")
+            if cur.fetchone()[0] == N:
+                print("reusing persisted t1 table + hnsw index", flush=True)
+                return
+        cur.execute(f"DROP TABLE IF EXISTS {T1_TABLE} CASCADE")
+        cur.execute(f"CREATE TABLE {T1_TABLE} "
+                    f"(id serial PRIMARY KEY, bucket int, embedding vector({DIM}))")
+        print(f"loading {N} rows into {T1_TABLE}...", flush=True)
+        with cur.copy(f"COPY {T1_TABLE} (bucket, embedding) FROM STDIN") as cp:
+            for i in range(N):
+                cp.write_row((int(buckets[i]), vstr(vectors[i])))
+        print("building pgvector hnsw index... (one-time; persisted)", flush=True)
+        cur.execute(f"""CREATE INDEX {T1_TABLE}_idx ON {T1_TABLE}
+                        USING hnsw (embedding vector_cosine_ops)
+                        WITH (m = 16, ef_construction = 64)""")
+
+
+def run_t1(conn, vectors, buckets, queries, configs):
+    """Tier 1 (AcornScan CustomScan over pgvector hnsw) leg.  Only the
+    direct-dist and single-read toggles touch this path."""
+    truth = [exact_truth(vectors, buckets, q) for q in queries]
+    qstrs = [vstr(q) for q in queries]
+    out = {}
+
+    def t1_config(cur, gucs):
+        cur.execute("SET enable_seqscan = off")
+        # The AcornScan custom path claims NIL pathkeys (planner adds a Sort),
+        # so the ordered hnsw Index Scan path always wins under LIMIT unless
+        # index scans are disabled.  This leg measures the t1 hook executor,
+        # not plan choice.
+        cur.execute("SET enable_indexscan = off")
+        cur.execute("SET pg_acorn.enable_hook = on")
+        for t, val in gucs.items():
+            cur.execute(f"SET pg_acorn.{t} = {'on' if val else 'off'}")
+
+    with conn.cursor() as cur:
+        for cname, gucs in configs:
+            t1_config(cur, gucs)
+            pages, provider = [], None
+            for qs in qstrs:
+                cur.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + T1_SQL,
+                            (SEL_BUCKET, qs, K))
+                plan = cur.fetchone()[0][0]["Plan"]
+                node = plan
+                while node["Node Type"] in ("Limit", "Sort", "Incremental Sort",
+                                            "Gather", "Result"):
+                    node = node["Plans"][0]
+                provider = node.get("Custom Plan Provider")
+                assert node["Node Type"] == "Custom Scan" and provider == "AcornScan", \
+                    f"t1 plan confound: {node['Node Type']} / {provider}"
+                pages.append(plan["Shared Hit Blocks"] + plan["Shared Read Blocks"])
+
+            ids_per_query, recalls = [], []
+            for qs, t in zip(qstrs, truth):
+                cur.execute(T1_SQL, (SEL_BUCKET, qs, K))
+                ids = [r[0] for r in cur.fetchall()]
+                ids_per_query.append(ids)
+                recalls.append(len(set(ids) & t) / K)
+            out[cname] = {
+                "gucs": gucs,
+                "pages_per_query": float(np.mean(pages)),
+                "recall": float(np.mean(recalls)),
+                "ids_per_query": ids_per_query,
+            }
+
+        lat = {cname: np.empty((REPEATS, NQ)) for cname, _ in configs}
+        for cname, gucs in configs:        # warmup
+            t1_config(cur, gucs)
+            for qs in qstrs:
+                cur.execute(T1_SQL, (SEL_BUCKET, qs, K))
+                cur.fetchall()
+        for r in range(REPEATS):
+            for cname, gucs in configs:
+                t1_config(cur, gucs)
+                L = lat[cname]
+                for qi, qs in enumerate(qstrs):
+                    t0 = time.perf_counter()
+                    cur.execute(T1_SQL, (SEL_BUCKET, qs, K))
+                    cur.fetchall()
+                    L[r, qi] = time.perf_counter() - t0
+
+    for cname, _ in configs:
+        min_lat = lat[cname].min(axis=0)
+        med_lat = np.median(lat[cname], axis=0)
+        out[cname]["qps_min"] = float(NQ / min_lat.sum())
+        out[cname]["lat_ms_p50"] = float(np.median(med_lat) * 1e3)
+        out[cname]["lat_ms_p90"] = float(np.quantile(med_lat, 0.9) * 1e3)
+
+    ref = out[configs[0][0]]["ids_per_query"]
+    for cname, _ in configs[1:]:
+        assert out[cname]["ids_per_query"] == ref, \
+            f"T1 TRAVERSAL CHANGED: config {cname} differs from {configs[0][0]}"
+    return out
 
 
 def detect_configs(cur):
@@ -185,9 +293,12 @@ def run_ef(conn, vectors, buckets, queries, ef, configs):
 
     for cname, _ in configs:
         min_lat = lat[cname].min(axis=0)
+        med_lat = np.median(lat[cname], axis=0)   # per-query median over repeats
         out[cname]["qps_min"] = float(NQ / min_lat.sum())
         out[cname]["lat_ms_min_mean"] = float(min_lat.mean() * 1e3)
-        out[cname]["qps_median"] = float(NQ / np.median(lat[cname], axis=0).sum())
+        out[cname]["lat_ms_p50"] = float(np.median(med_lat) * 1e3)
+        out[cname]["lat_ms_p90"] = float(np.quantile(med_lat, 0.9) * 1e3)
+        out[cname]["qps_median"] = float(NQ / med_lat.sum())
 
     # identity across configs
     ref = out[configs[0][0]]["ids_per_query"]
@@ -225,7 +336,22 @@ def main():
         results["efs"][str(ef)] = r
         for cname, _ in configs:
             c = r[cname]
-            print(f"  ef={ef:>4} {cname:<18} qps_min={c['qps_min']:8.1f}  "
+            print(f"  ef={ef:>4} {cname:<22} qps_min={c['qps_min']:8.1f}  "
+                  f"p50={c['lat_ms_p50']:7.3f}ms  p90={c['lat_ms_p90']:7.3f}ms  "
+                  f"recall={c['recall']:.3f}  pages/q={c['pages_per_query']:8.1f}",
+                  flush=True)
+
+    # --- Tier 1 leg (only the toggles that touch the t1 path) ---
+    t1_configs = [c for c in configs if c[0] in
+                  ("alloff", "+scan_direct_dist", "+scan_single_read")]
+    if len(t1_configs) > 1:
+        ensure_t1(conn, vectors, buckets)
+        t1 = run_t1(conn, vectors, buckets, queries, t1_configs)
+        results["t1"] = t1
+        for cname, _ in t1_configs:
+            c = t1[cname]
+            print(f"  t1      {cname:<22} qps_min={c['qps_min']:8.1f}  "
+                  f"p50={c['lat_ms_p50']:7.3f}ms  p90={c['lat_ms_p90']:7.3f}ms  "
                   f"recall={c['recall']:.3f}  pages/q={c['pages_per_query']:8.1f}",
                   flush=True)
 

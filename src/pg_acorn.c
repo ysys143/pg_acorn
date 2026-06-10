@@ -45,6 +45,18 @@ bool acorn_scan_prefetch = false;
  */
 bool acorn_scan_single_read = true;
 
+/*
+ * GUC: Tier 2 scan fast-path toggle — single hash probe for the visited set
+ * (HASH_ENTER with found flag instead of HASH_FIND + HASH_ENTER).
+ */
+bool acorn_scan_visited_oneprobe = true;
+
+/*
+ * GUC: Tier 2 scan fast-path toggle — direct int4 comparison for known
+ * btree int4 operator predicates in the inline filter (fmgr bypass).
+ */
+bool acorn_scan_direct_filter = true;
+
 void _PG_init(void);
 void _PG_fini(void);
 
@@ -141,6 +153,34 @@ _PG_init(void)
 		"results identical).",
 		NULL,
 		&acorn_scan_single_read,
+		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_visited_oneprobe */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_visited_oneprobe",
+		"Use a single hash probe (HASH_ENTER) for the acorn_hnsw scan "
+		"visited set instead of find-then-enter (debug/benchmark; results "
+		"identical).",
+		NULL,
+		&acorn_scan_visited_oneprobe,
+		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_direct_filter */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_direct_filter",
+		"Evaluate known int4 comparison predicates on the inline filter "
+		"value with direct C compares instead of fmgr (debug/benchmark; "
+		"results identical).",
+		NULL,
+		&acorn_scan_direct_filter,
 		true,
 		PGC_USERSET,
 		0,

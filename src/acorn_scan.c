@@ -20,6 +20,7 @@
 #include "executor/tuptable.h"
 #include "lib/pairingheap.h"
 #include "storage/bufmgr.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -114,6 +115,19 @@ mark_visited(HTAB *visited, const ItemPointerData *tid)
 {
 	bool found;
 	hash_search(visited, (void *) tid, HASH_ENTER, &found);
+}
+
+/*
+ * Single-probe visit: enter the TID, return true iff it was NOT already
+ * present (first visit).  Identical semantics to is_visited+mark_visited
+ * with one hash probe instead of two.
+ */
+static inline bool
+visit_once(HTAB *visited, const ItemPointerData *tid)
+{
+	bool found;
+	hash_search(visited, (void *) tid, HASH_ENTER, &found);
+	return !found;
 }
 
 /* -----------------------------------------------------------------------
@@ -1012,6 +1026,36 @@ acorn_t2_eval_filter(ScanKey keys, int nkeys, int64 stored_val)
 	for (i = 0; i < nkeys; i++)
 	{
 		/*
+		 * Fast path: known btree int4 predicates compared directly in C
+		 * (fmgr bypass; integer compare is trivially identical to the
+		 * int4lt/int4le/... implementations).
+		 */
+		if (acorn_scan_direct_filter)
+		{
+			int32	a = DatumGetInt32((Datum) stored_val);
+			int32	b = DatumGetInt32(keys[i].sk_argument);
+			bool	known = true;
+			bool	ok = false;
+
+			switch (keys[i].sk_func.fn_oid)
+			{
+				case F_INT4LT: ok = (a <  b); break;
+				case F_INT4LE: ok = (a <= b); break;
+				case F_INT4EQ: ok = (a == b); break;
+				case F_INT4GE: ok = (a >= b); break;
+				case F_INT4GT: ok = (a >  b); break;
+				default: known = false; break;
+			}
+
+			if (known)
+			{
+				if (!ok)
+					return false;
+				continue;
+			}
+		}
+
+		/*
 		 * sk_func is the operator's own predicate (e.g. int4lt for <),
 		 * which returns a boolean Datum directly — not a comparison integer.
 		 */
@@ -1175,9 +1219,17 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 
 		if (!ItemPointerIsValid(&neighbors[i]))
 			continue;
-		if (is_visited(s->visited, &neighbors[i]))
-			continue;
-		mark_visited(s->visited, &neighbors[i]);
+		if (acorn_scan_visited_oneprobe)
+		{
+			if (!visit_once(s->visited, &neighbors[i]))
+				continue;
+		}
+		else
+		{
+			if (is_visited(s->visited, &neighbors[i]))
+				continue;
+			mark_visited(s->visited, &neighbors[i]);
+		}
 
 		nblkno = ItemPointerGetBlockNumber(&neighbors[i]);
 		noffno = ItemPointerGetOffsetNumber(&neighbors[i]);
