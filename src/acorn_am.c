@@ -56,6 +56,11 @@ acorn_am_init(void)
 					  "ACORN gamma: store m*gamma neighbors per node",
 					  ACORN_DEFAULT_GAMMA, ACORN_MIN_GAMMA, ACORN_MAX_GAMMA,
 					  AccessExclusiveLock);
+	add_bool_reloption(acorn_relopt_kind, "acorn_payload_edges",
+					   "Split layer-0 neighbor slots: half global nearest, "
+					   "half nearest within the same payload partition",
+					   false,
+					   AccessExclusiveLock);
 }
 
 static bytea *
@@ -65,6 +70,7 @@ acorn_options(Datum reloptions, bool validate)
 		{"m", RELOPT_TYPE_INT, offsetof(AcornOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(AcornOptions, efConstruction)},
 		{"acorn_gamma", RELOPT_TYPE_INT, offsetof(AcornOptions, gamma)},
+		{"acorn_payload_edges", RELOPT_TYPE_BOOL, offsetof(AcornOptions, payloadEdges)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,

@@ -44,6 +44,7 @@ typedef struct AcornOptions
 	int			m;				/* base connections per node */
 	int			efConstruction;	/* candidate list size at build time */
 	int			gamma;			/* ACORN-gamma multiplier (m_eff = m*gamma) */
+	bool		payloadEdges;	/* split layer-0 slots: half global / half same-partition */
 } AcornOptions;
 
 /* -----------------------------------------------------------------------

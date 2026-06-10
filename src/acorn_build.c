@@ -76,6 +76,35 @@ acorn_opt_gamma(Relation index)
 	return opts ? opts->gamma : acorn_default_gamma;
 }
 
+static bool
+acorn_opt_payload_edges(Relation index)
+{
+	AcornOptions *opts = (AcornOptions *) index->rd_options;
+	return opts ? opts->payloadEdges : false;
+}
+
+/* -----------------------------------------------------------------------
+ * Payload partitions (acorn_payload_edges)
+ *
+ * Nodes are grouped into ACORN_PAYLOAD_PARTITIONS partitions by filter_val.
+ * The hash is identity mod 256: for low-cardinality int4 payloads (e.g.
+ * bucket 0..99) partition == value, mirroring Qdrant's per-value sub-HNSW.
+ * When the option is on, each node's layer-0 neighbor slots (2*m_eff) are
+ * split: the first m_eff hold global nearest neighbors, the last m_eff hold
+ * nearest neighbors within the node's own partition.  The scan needs no
+ * changes — it walks all stored slots and ACORN keeps filter-failing nodes
+ * in the candidate heap, so same-partition edges make the predicate
+ * subgraph navigable.
+ * ----------------------------------------------------------------------- */
+
+#define ACORN_PAYLOAD_PARTITIONS 256
+
+static inline int
+acorn_payload_partition(int64 filter_val)
+{
+	return (int) (((uint64) filter_val) & (ACORN_PAYLOAD_PARTITIONS - 1));
+}
+
 /* Effective neighbor multiplier: m * gamma, capped so neighbor tuples fit a page */
 static int
 acorn_m_eff(Relation index)
@@ -333,13 +362,14 @@ acorn_append_tuple(Relation index, ForkNumber forkNum, Item tup, Size size,
 
 /*
  * Read an element tuple; optionally return level, neighbor tuple location,
- * and a palloc'd copy of the inline vector.  All out-params may be NULL.
+ * a palloc'd copy of the inline vector, and the inline filter value.
+ * All out-params may be NULL.
  */
 static void
 acorn_read_element(Relation index, ForkNumber forkNum, ItemPointer tid,
 				   int *level_out,
 				   BlockNumber *nbr_blkno, OffsetNumber *nbr_offno,
-				   Datum *vec_copy)
+				   Datum *vec_copy, int64 *filter_out)
 {
 	Buffer				buf;
 	Page				page;
@@ -366,14 +396,19 @@ acorn_read_element(Relation index, ForkNumber forkNum, ItemPointer tid,
 		vsize = VARSIZE_ANY(vec);
 		*vec_copy = PointerGetDatum(memcpy(palloc(vsize), vec, vsize));
 	}
+	if (filter_out)
+		*filter_out = etup->filter_val;
 	UnlockReleaseBuffer(buf);
 }
 
-/* Compute distance from the inline vector of (blkno, offno) to query. */
+/*
+ * Compute distance from the inline vector of (blkno, offno) to query.
+ * Optionally returns the inline filter value in the same page read.
+ */
 static double
 acorn_node_distance(Relation index, ForkNumber forkNum,
 					BlockNumber blkno, OffsetNumber offno,
-					Datum query, FmgrInfo *proc)
+					Datum query, FmgrInfo *proc, int64 *filter_out)
 {
 	Buffer				buf;
 	Page				page;
@@ -385,6 +420,8 @@ acorn_node_distance(Relation index, ForkNumber forkNum,
 	page = BufferGetPage(buf);
 	etup = (AcornT2ElementTuple) PageGetItem(page, PageGetItemId(page, offno));
 	dist = acorn_dist(proc, PointerGetDatum(AcornT2ElementTupleGetVector(etup)), query);
+	if (filter_out)
+		*filter_out = etup->filter_val;
 	UnlockReleaseBuffer(buf);
 	return dist;
 }
@@ -418,7 +455,7 @@ acorn_read_nbr_tids_at_layer(Relation index, ForkNumber forkNum,
 	for (int i = 0; i < count; i++)
 	{
 		if (!ItemPointerIsValid(&tids[start + i]))
-			break;
+			continue;	/* payload split may leave gaps between halves */
 		tids_out[n++] = tids[start + i];
 	}
 
@@ -518,6 +555,8 @@ typedef struct AcornMemBuild
 	int				entry_level;
 	uint32		   *visit_gen;		/* size = capacity; generation-based visited set */
 	uint32			cur_gen;
+	bool			payload_edges;	/* split layer-0 slots global/partition halves */
+	int			   *part_entry;		/* partition -> first member node id, -1 = none */
 	MemoryContext	build_ctx;
 } AcornMemBuild;
 
@@ -556,6 +595,10 @@ acorn_mem_build_init(MemoryContext ctx)
 	mb->entry_level = -1;
 	mb->cur_gen     = 1;
 	mb->build_ctx   = ctx;
+	mb->payload_edges = false;
+	mb->part_entry  = palloc(ACORN_PAYLOAD_PARTITIONS * sizeof(int));
+	for (int p = 0; p < ACORN_PAYLOAD_PARTITIONS; p++)
+		mb->part_entry[p] = -1;
 	MemoryContextSwitchTo(old);
 	return mb;
 }
@@ -620,7 +663,7 @@ acorn_mem_greedy_descend(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
 				double nd;
 
 				if (nbr_id < 0)
-					break;
+					continue;	/* payload split may leave gaps between halves */
 				nd = acorn_dist(proc, mb->nodes[nbr_id].vec, query);
 				if (nd < cur_dist)
 				{
@@ -693,7 +736,7 @@ acorn_mem_search_layer(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
 			double nd;
 
 			if (nbr_id < 0)
-				break;
+				continue;	/* payload split may leave gaps between halves */
 			if (mb->visit_gen[nbr_id] == mb->cur_gen)
 				continue;
 			if (mb->nodes[nbr_id].level < layer)
@@ -737,6 +780,197 @@ acorn_mem_search_layer(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
 }
 
 /*
+ * In-memory layer-0 beam search restricted to one payload partition.
+ *
+ * Starts at entry_id (a member of `part`) and explores only nodes whose
+ * filter_val maps to `part`.  Expansion walks ALL of a member's layer-0
+ * slots (both the global and the payload half) — non-members are skipped,
+ * members are kept.  Because every partition member is wired to the nearest
+ * existing members on insert (bidirectionally, payload half), the partition
+ * subgraph stays connected and this search behaves like a per-partition
+ * single-layer HNSW (Qdrant's "Filterable HNSW" merged sub-graph).
+ *
+ * Returns up to ef same-partition node ids nearest-first.
+ */
+static int
+acorn_mem_search_partition(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
+						   int entry_id, Datum query, int part, int ef,
+						   int *out_ids, double *out_dists)
+{
+	MemoryContext  tmp_ctx, old_ctx;
+	pairingheap   *C, *W;
+	int			   W_count = 0;
+	int			   n_out;
+
+	tmp_ctx = AllocSetContextCreate(mb->build_ctx, "acorn_mem_part_search",
+									ALLOCSET_SMALL_SIZES);
+	old_ctx = MemoryContextSwitchTo(tmp_ctx);
+
+	mb->cur_gen++;
+	C = pairingheap_allocate(mem_cmp_min, NULL);
+	W = pairingheap_allocate(mem_cmp_max, NULL);
+
+	{
+		double     ep_dist = acorn_dist(proc, mb->nodes[entry_id].vec, query);
+		MemPQNode *cn, *wn;
+
+		Assert(acorn_payload_partition(mb->nodes[entry_id].filter_val) == part);
+		mb->visit_gen[entry_id] = mb->cur_gen;
+		cn = palloc(sizeof(MemPQNode)); cn->id = entry_id; cn->dist = ep_dist;
+		pairingheap_add(C, &cn->ph);
+		wn = palloc(sizeof(MemPQNode)); wn->id = entry_id; wn->dist = ep_dist;
+		pairingheap_add(W, &wn->ph);
+		W_count = 1;
+	}
+
+	while (!pairingheap_is_empty(C))
+	{
+		MemPQNode    *c_node = (MemPQNode *) pairingheap_remove_first(C);
+		int			  c_id   = c_node->id;
+		double		  c_dist = c_node->dist;
+		AcornMemNode *c_data = &mb->nodes[c_id];
+		double		  f_dist;
+		int			  start, layer_m;
+
+		f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
+		if (c_dist > f_dist && W_count >= ef)
+			break;
+
+		start   = HnswNeighborStart(m_eff, c_data->level, 0);
+		layer_m = HnswGetLayerM(m_eff, 0);
+
+		for (int j = 0; j < layer_m; j++)
+		{
+			int    nbr_id = c_data->nbr[start + j];
+			double nd;
+
+			if (nbr_id < 0)
+				continue;
+			if (mb->visit_gen[nbr_id] == mb->cur_gen)
+				continue;
+			mb->visit_gen[nbr_id] = mb->cur_gen;
+
+			if (acorn_payload_partition(mb->nodes[nbr_id].filter_val) != part)
+				continue;	/* restricted to the partition subgraph */
+
+			nd     = acorn_dist(proc, mb->nodes[nbr_id].vec, query);
+			f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
+
+			if (nd < f_dist || W_count < ef)
+			{
+				MemPQNode *cn, *wn;
+
+				cn = palloc(sizeof(MemPQNode)); cn->id = nbr_id; cn->dist = nd;
+				pairingheap_add(C, &cn->ph);
+				wn = palloc(sizeof(MemPQNode)); wn->id = nbr_id; wn->dist = nd;
+				pairingheap_add(W, &wn->ph);
+				W_count++;
+
+				if (W_count > ef)
+				{
+					(void) pairingheap_remove_first(W);
+					W_count--;
+				}
+			}
+		}
+	}
+
+	n_out = W_count;
+	for (int i = W_count - 1; i >= 0; i--)
+	{
+		MemPQNode *wn  = (MemPQNode *) pairingheap_remove_first(W);
+		out_ids[i]   = wn->id;
+		out_dists[i] = wn->dist;
+	}
+
+	MemoryContextSwitchTo(old_ctx);
+	MemoryContextDelete(tmp_ctx);
+	return n_out;
+}
+
+/*
+ * Bidirectional edge with FIXED-SLOT RETRY restricted to a slot range
+ * [slot_base, slot_base + slot_count) of nbr_id's flat slot array.
+ * With payload edges off the range covers a whole layer; with payload edges
+ * on, layer-0 global and payload halves are maintained independently so a
+ * flood of global candidates can never evict same-partition edges.
+ *
+ * If part >= 0 (payload half), slots occupied by nodes OUTSIDE the partition
+ * (graceful-degradation backfill) are evicted preferentially: a same-
+ * partition edge is strictly more valuable there.  Otherwise the standard
+ * replace-furthest-if-closer retry applies.
+ */
+static void
+acorn_mem_add_reverse_edge(AcornMemBuild *mb, FmgrInfo *proc,
+						   int nbr_id, int new_id,
+						   int slot_base, int slot_count, int part)
+{
+	AcornMemNode *nbr_node = &mb->nodes[nbr_id];
+	AcornMemNode *node     = &mb->nodes[new_id];
+	int			  free_slot = -1;
+	int			  nonmember_slot = -1;
+	double		  nonmember_d = -DBL_MAX;
+
+	for (int j = 0; j < slot_count; j++)
+	{
+		int eid = nbr_node->nbr[slot_base + j];
+
+		if (eid == new_id)
+			return;				/* already connected */
+		if (eid < 0)
+		{
+			if (free_slot < 0)
+				free_slot = j;
+			continue;
+		}
+		if (part >= 0 &&
+			acorn_payload_partition(mb->nodes[eid].filter_val) != part)
+		{
+			double d = acorn_dist(proc, nbr_node->vec, mb->nodes[eid].vec);
+
+			if (d > nonmember_d)
+			{
+				nonmember_d    = d;
+				nonmember_slot = j;
+			}
+		}
+	}
+
+	if (free_slot >= 0)
+	{
+		nbr_node->nbr[slot_base + free_slot] = new_id;
+		return;
+	}
+
+	if (nonmember_slot >= 0)
+	{
+		nbr_node->nbr[slot_base + nonmember_slot] = new_id;
+		return;
+	}
+
+	/* Full: replace the furthest existing neighbor if the new node is closer */
+	{
+		double d_new      = acorn_dist(proc, nbr_node->vec, node->vec);
+		double furthest_d = -DBL_MAX;
+		int    furthest_j = -1;
+
+		for (int j = 0; j < slot_count; j++)
+		{
+			int    eid = nbr_node->nbr[slot_base + j];
+			double d   = acorn_dist(proc, nbr_node->vec, mb->nodes[eid].vec);
+
+			if (d > furthest_d)
+			{
+				furthest_d = d;
+				furthest_j = j;
+			}
+		}
+		if (d_new < furthest_d)
+			nbr_node->nbr[slot_base + furthest_j] = new_id;
+	}
+}
+
+/*
  * In-memory HNSW insert for node new_id.
  * Assigns level, allocates nbr array, runs greedy descent + beam search,
  * fills neighbor IDs, and writes reverse edges with fixed-slot retry.
@@ -762,6 +996,9 @@ acorn_mem_insert_node(AcornMemBuild *mb, FmgrInfo *proc, int m_eff, int efc,
 	{
 		mb->entry_id    = new_id;
 		mb->entry_level = level;
+		if (mb->payload_edges &&
+			mb->part_entry[acorn_payload_partition(node->filter_val)] < 0)
+			mb->part_entry[acorn_payload_partition(node->filter_val)] = new_id;
 		return;
 	}
 
@@ -782,64 +1019,100 @@ acorn_mem_insert_node(AcornMemBuild *mb, FmgrInfo *proc, int m_eff, int efc,
 											  ep_id, node->vec, lc, efc,
 											  out_ids, out_dists);
 
-		for (int i = 0; i < Min(n_cands, layer_m); i++)
-			node->nbr[start + i] = out_ids[i];
+		if (lc == 0 && mb->payload_edges)
+		{
+			/*
+			 * Split layer-0 slots: [start, start+g_half) = global nearest,
+			 * [start+g_half, start+layer_m) = nearest same-partition members.
+			 */
+			int  g_half   = layer_m / 2;	/* = m_eff */
+			int  p_half   = layer_m - g_half;
+			int  part     = acorn_payload_partition(node->filter_val);
+			int  n_global = Min(n_cands, g_half);
+			int  p_filled = 0;
+
+			for (int i = 0; i < n_global; i++)
+				node->nbr[start + i] = out_ids[i];
+
+			if (mb->part_entry[part] >= 0)
+			{
+				int    *p_ids   = palloc(sizeof(int) * efc);
+				double *p_dists = palloc(sizeof(double) * efc);
+				int     n_part  = acorn_mem_search_partition(mb, proc, m_eff,
+															 mb->part_entry[part],
+															 node->vec, part, efc,
+															 p_ids, p_dists);
+
+				for (int i = 0; i < n_part && p_filled < p_half; i++)
+				{
+					bool dup = false;
+
+					for (int j = 0; j < n_global; j++)
+					{
+						if (node->nbr[start + j] == p_ids[i])
+						{
+							dup = true;
+							break;
+						}
+					}
+					if (dup)
+						continue;	/* already a global neighbor of this node */
+
+					node->nbr[start + g_half + p_filled] = p_ids[i];
+					p_filled++;
+
+					/* bidirectional: reverse edge into the member's payload half */
+					acorn_mem_add_reverse_edge(mb, proc, p_ids[i], new_id,
+						HnswNeighborStart(m_eff, mb->nodes[p_ids[i]].level, 0) + g_half,
+						p_half, part);
+				}
+				pfree(p_ids);
+				pfree(p_dists);
+			}
+
+			/*
+			 * Graceful degradation: if the partition is still too small, fill
+			 * remaining payload slots with the next-best global candidates
+			 * (forward edges only — they are not partition members).
+			 */
+			for (int i = g_half; i < n_cands && p_filled < p_half; i++)
+			{
+				bool dup = false;
+
+				for (int j = 0; j < p_filled; j++)
+				{
+					if (node->nbr[start + g_half + j] == out_ids[i])
+					{
+						dup = true;
+						break;
+					}
+				}
+				if (dup)
+					continue;
+				node->nbr[start + g_half + p_filled] = out_ids[i];
+				p_filled++;
+			}
+
+			/* Reverse edges for the global half into neighbors' global halves */
+			for (int i = 0; i < n_global; i++)
+				acorn_mem_add_reverse_edge(mb, proc, out_ids[i], new_id,
+					HnswNeighborStart(m_eff, mb->nodes[out_ids[i]].level, 0),
+					g_half, -1);
+		}
+		else
+		{
+			for (int i = 0; i < Min(n_cands, layer_m); i++)
+				node->nbr[start + i] = out_ids[i];
+
+			/* Reverse edges with fixed-slot retry over the whole layer range */
+			for (int i = 0; i < Min(n_cands, layer_m); i++)
+				acorn_mem_add_reverse_edge(mb, proc, out_ids[i], new_id,
+					HnswNeighborStart(m_eff, mb->nodes[out_ids[i]].level, lc),
+					layer_m, -1);
+		}
 
 		if (n_cands > 0)
 			ep_id = out_ids[0];
-
-		/* Reverse edges with fixed-slot retry */
-		for (int i = 0; i < Min(n_cands, layer_m); i++)
-		{
-			int           nbr_id    = out_ids[i];
-			AcornMemNode *nbr_node  = &mb->nodes[nbr_id];
-			int           nbr_lm    = HnswGetLayerM(m_eff, lc);
-			int           nbr_start = HnswNeighborStart(m_eff, nbr_node->level, lc);
-			int           slot      = -1;
-			int           len;
-
-			for (len = 0; len < nbr_lm; len++)
-			{
-				if (nbr_node->nbr[nbr_start + len] < 0)
-					break;
-				if (nbr_node->nbr[nbr_start + len] == new_id)
-				{
-					slot = -2;	/* already connected */
-					break;
-				}
-			}
-			if (slot == -2)
-				continue;
-
-			if (len < nbr_lm)
-			{
-				slot = len;
-			}
-			else
-			{
-				double d_new = acorn_dist(proc, nbr_node->vec, node->vec);
-				double furthest_d = -DBL_MAX;
-				int    furthest_j = -1;
-
-				for (int j = 0; j < nbr_lm; j++)
-				{
-					int    eid = nbr_node->nbr[nbr_start + j];
-					double d   = acorn_dist(proc, nbr_node->vec,
-											 mb->nodes[eid].vec);
-
-					if (d > furthest_d)
-					{
-						furthest_d = d;
-						furthest_j = j;
-					}
-				}
-				if (d_new < furthest_d)
-					slot = furthest_j;
-			}
-
-			if (slot >= 0)
-				nbr_node->nbr[nbr_start + slot] = new_id;
-		}
 	}
 
 	pfree(out_ids);
@@ -850,6 +1123,10 @@ acorn_mem_insert_node(AcornMemBuild *mb, FmgrInfo *proc, int m_eff, int efc,
 		mb->entry_level = level;
 		mb->entry_id    = new_id;
 	}
+
+	if (mb->payload_edges &&
+		mb->part_entry[acorn_payload_partition(node->filter_val)] < 0)
+		mb->part_entry[acorn_payload_partition(node->filter_val)] = new_id;
 }
 
 /* Run in-memory HNSW construction for all collected nodes. */
@@ -1034,7 +1311,7 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 				HnswNeighborTuple ntup;
 
 				if (nbr_id < 0)
-					break;
+					continue;	/* payload split may leave gaps between halves */
 
 				buf  = ReadBufferExtended(index, forkNum,
 										  node->nbr_blkno, RBM_NORMAL, NULL);
@@ -1095,10 +1372,10 @@ acorn_greedy_descend_build(Relation index, ForkNumber forkNum,
 			improved = false;
 			cur_dist = acorn_node_distance(index, forkNum,
 										   *cur_blkno, *cur_offno,
-										   query, proc);
+										   query, proc, NULL);
 			ItemPointerSet(&c_tid, *cur_blkno, *cur_offno);
 			acorn_read_element(index, forkNum, &c_tid, &c_level,
-							   &c_nbr_blk, &c_nbr_off, NULL);
+							   &c_nbr_blk, &c_nbr_off, NULL, NULL);
 
 			n_nbrs = acorn_read_nbr_tids_at_layer(index, forkNum,
 												   c_nbr_blk, c_nbr_off,
@@ -1110,7 +1387,7 @@ acorn_greedy_descend_build(Relation index, ForkNumber forkNum,
 				double nd = acorn_node_distance(index, forkNum,
 												 ItemPointerGetBlockNumber(&nbrs[i]),
 												 ItemPointerGetOffsetNumber(&nbrs[i]),
-												 query, proc);
+												 query, proc, NULL);
 				if (nd < cur_dist)
 				{
 					cur_dist   = nd;
@@ -1137,18 +1414,26 @@ typedef struct AcornCand
 } AcornCand;
 
 /*
- * Bounded beam search at `layer` for construction (no predicate).
+ * Bounded beam search at `layer` for construction.
  *
  * Implements the standard HNSW Algorithm 2 "SEARCH-LAYER" with ef-bounded
  * candidate set.  Returns up to ef candidates in out_cands[] sorted
  * nearest-first; out_cands must have ef slots.  Returns actual count.
+ *
+ * If part >= 0 the result set W is restricted to nodes whose filter_val maps
+ * to that payload partition while exploration (C) remains unrestricted —
+ * the ACORN-style search used by the incremental-insert payload-edge path,
+ * where no in-memory partition entry map exists.  max_expansions caps the
+ * work in that mode (a sparse partition might otherwise force a full
+ * traversal); pass 0 for the standard unrestricted search.
  */
 static int
 acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 								  BlockNumber entry_blkno, OffsetNumber entry_offno,
 								  Datum query, FmgrInfo *proc, int m_eff,
 								  int layer, int ef,
-								  AcornCand *out_cands)
+								  AcornCand *out_cands,
+								  int part, int max_expansions)
 {
 	pairingheap    *C;			/* min-heap: candidates (closest at top) */
 	pairingheap    *W;			/* max-heap: current best set (furthest at top) */
@@ -1156,6 +1441,7 @@ acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 	int				W_count = 0;
 	MemoryContext	tmp_ctx, old_ctx;
 	int				n_out;
+	int				n_expansions = 0;
 
 	tmp_ctx = AllocSetContextCreate(CurrentMemoryContext,
 									"acorn_build_search",
@@ -1170,24 +1456,28 @@ acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 	{
 		ItemPointerData ep_tid;
 		double			ep_dist;
+		int64			ep_fval;
 		BuildPQNode    *cn, *wn;
 
 		ItemPointerSet(&ep_tid, entry_blkno, entry_offno);
 		build_mark_visited(visited, &ep_tid);
 		ep_dist = acorn_node_distance(index, forkNum,
 									   entry_blkno, entry_offno,
-									   query, proc);
+									   query, proc, &ep_fval);
 
 		cn           = palloc(sizeof(BuildPQNode));
 		cn->tid      = ep_tid;
 		cn->distance = ep_dist;
 		pairingheap_add(C, &cn->ph_node);
 
-		wn           = palloc(sizeof(BuildPQNode));
-		wn->tid      = ep_tid;
-		wn->distance = ep_dist;
-		pairingheap_add(W, &wn->ph_node);
-		W_count = 1;
+		if (part < 0 || acorn_payload_partition(ep_fval) == part)
+		{
+			wn           = palloc(sizeof(BuildPQNode));
+			wn->tid      = ep_tid;
+			wn->distance = ep_dist;
+			pairingheap_add(W, &wn->ph_node);
+			W_count = 1;
+		}
 	}
 
 	while (!pairingheap_is_empty(C))
@@ -1208,13 +1498,19 @@ acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 		pfree(c_node);
 
 		/* HNSW termination: candidate farther than worst result and W is full */
-		f_dist = ((BuildPQNode *) pairingheap_first(W))->distance;
+		f_dist = pairingheap_is_empty(W) ? DBL_MAX
+			: ((BuildPQNode *) pairingheap_first(W))->distance;
 		if (c_dist > f_dist && W_count >= ef)
 			break;
 
+		/* Restricted mode: bound total exploration work */
+		if (max_expansions > 0 && n_expansions >= max_expansions)
+			break;
+		n_expansions++;
+
 		/* Load c's level + neighbor tuple location (no lock held at this point) */
 		acorn_read_element(index, forkNum, &c_tid, &c_level,
-						   &c_nbr_blk, &c_nbr_off, NULL);
+						   &c_nbr_blk, &c_nbr_off, NULL, NULL);
 
 		n_nbrs = acorn_read_nbr_tids_at_layer(index, forkNum,
 											   c_nbr_blk, c_nbr_off,
@@ -1224,6 +1520,8 @@ acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 		for (int i = 0; i < n_nbrs; i++)
 		{
 			double		 nd;
+			int64		 nfval;
+			bool		 is_member;
 			BuildPQNode *cn, *wn;
 
 			if (!ItemPointerIsValid(&nbrs[i]))
@@ -1235,28 +1533,33 @@ acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 			nd = acorn_node_distance(index, forkNum,
 									  ItemPointerGetBlockNumber(&nbrs[i]),
 									  ItemPointerGetOffsetNumber(&nbrs[i]),
-									  query, proc);
+									  query, proc, &nfval);
+			is_member = (part < 0 || acorn_payload_partition(nfval) == part);
 
-			f_dist = ((BuildPQNode *) pairingheap_first(W))->distance;
-			if (nd < f_dist || W_count < ef)
+			f_dist = pairingheap_is_empty(W) ? DBL_MAX
+				: ((BuildPQNode *) pairingheap_first(W))->distance;
+			if (nd < f_dist || W_count < ef || part >= 0)
 			{
 				cn           = palloc(sizeof(BuildPQNode));
 				cn->tid      = nbrs[i];
 				cn->distance = nd;
 				pairingheap_add(C, &cn->ph_node);
 
-				wn           = palloc(sizeof(BuildPQNode));
-				wn->tid      = nbrs[i];
-				wn->distance = nd;
-				pairingheap_add(W, &wn->ph_node);
-				W_count++;
-
-				if (W_count > ef)
+				if (is_member && (nd < f_dist || W_count < ef))
 				{
-					BuildPQNode *evicted =
-						(BuildPQNode *) pairingheap_remove_first(W);
-					pfree(evicted);
-					W_count--;
+					wn           = palloc(sizeof(BuildPQNode));
+					wn->tid      = nbrs[i];
+					wn->distance = nd;
+					pairingheap_add(W, &wn->ph_node);
+					W_count++;
+
+					if (W_count > ef)
+					{
+						BuildPQNode *evicted =
+							(BuildPQNode *) pairingheap_remove_first(W);
+						pfree(evicted);
+						W_count--;
+					}
 				}
 			}
 		}
@@ -1308,10 +1611,10 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 								 ItemPointer n_tid,
 								 BlockNumber e_blk, OffsetNumber e_off,
 								 Datum e_value, FmgrInfo *proc,
-								 int m_eff, int layer)
+								 int m_eff, int layer,
+								 int range_off, int range_len, int part)
 {
 	int				  n_level;
-	int				  layer_m = HnswGetLayerM(m_eff, layer);
 	BlockNumber		  n_nbr_blk;
 	OffsetNumber	  n_nbr_off;
 	Datum			  n_vec;
@@ -1321,57 +1624,85 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 	ItemPointerData  *tids;
 	ItemPointerData	  tids_copy[HNSW_MAX_NEIGHBORS];
 	int				  start;
-	int				  len    = 0;
 	int				  target = -1;
+	int				  nonmember_j = -1;
+	double			  nonmember_d = -DBL_MAX;
 
-	Assert(layer_m <= HNSW_MAX_NEIGHBORS);
+	Assert(range_len <= HNSW_MAX_NEIGHBORS);
+	Assert(range_off + range_len <= HnswGetLayerM(m_eff, layer));
 
 	/* --- Phase 1: read N's element tuple (level + neighbor location + vector) --- */
 	acorn_read_element(index, forkNum, n_tid, &n_level,
-					   &n_nbr_blk, &n_nbr_off, &n_vec);
-	start = HnswNeighborStart(m_eff, n_level, layer);
+					   &n_nbr_blk, &n_nbr_off, &n_vec, NULL);
+	start = HnswNeighborStart(m_eff, n_level, layer) + range_off;
 
-	/* --- Phase 1a: copy N's layer slots under SHARE (release before any write) --- */
+	/* --- Phase 1a: copy N's range slots under SHARE (release before any write) --- */
 	buf  = ReadBufferExtended(index, forkNum, n_nbr_blk, RBM_NORMAL, NULL);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, n_nbr_off));
 	tids = HnswNeighborTupleGetTids(ntup);
-	memcpy(tids_copy, &tids[start], layer_m * sizeof(ItemPointerData));
+	memcpy(tids_copy, &tids[start], range_len * sizeof(ItemPointerData));
 	UnlockReleaseBuffer(buf);
 
 	/* Find the first empty slot; bail if E is already connected */
-	for (len = 0; len < layer_m; len++)
+	for (int j = 0; j < range_len; j++)
 	{
-		if (!ItemPointerIsValid(&tids_copy[len]))
-			break;
-		if (ItemPointerGetBlockNumber(&tids_copy[len]) == e_blk &&
-			ItemPointerGetOffsetNumber(&tids_copy[len]) == e_off)
+		if (!ItemPointerIsValid(&tids_copy[j]))
+		{
+			if (target < 0)
+				target = j;
+			continue;
+		}
+		if (ItemPointerGetBlockNumber(&tids_copy[j]) == e_blk &&
+			ItemPointerGetOffsetNumber(&tids_copy[j]) == e_off)
 		{
 			pfree(DatumGetPointer(n_vec));
 			return;
 		}
 	}
 
-	if (len < layer_m)
+	if (target < 0 && part >= 0)
 	{
-		/* Free slot available */
-		target = len;
+		/*
+		 * Payload half full: prefer evicting the furthest occupant that is NOT
+		 * a partition member (graceful-degradation backfill) — a same-
+		 * partition edge is strictly more valuable there.
+		 */
+		for (int j = 0; j < range_len; j++)
+		{
+			int64  fj;
+			Datum  vj;
+			double d;
+
+			acorn_read_element(index, forkNum, &tids_copy[j],
+							   NULL, NULL, NULL, &vj, &fj);
+			d = acorn_dist(proc, n_vec, vj);
+			pfree(DatumGetPointer(vj));
+			if (acorn_payload_partition(fj) != part && d > nonmember_d)
+			{
+				nonmember_d = d;
+				nonmember_j = j;
+			}
+		}
+		if (nonmember_j >= 0)
+			target = nonmember_j;
 	}
-	else
+
+	if (target < 0)
 	{
 		/* --- Phase 1b: full — retry: find furthest, replace if E is closer --- */
 		double furthest_d = -DBL_MAX;
 		int    furthest_j = -1;
 		double dEN        = acorn_dist(proc, n_vec, e_value);
 
-		for (int j = 0; j < layer_m; j++)
+		for (int j = 0; j < range_len; j++)
 		{
 			Datum  vj;
 			double d;
 
 			acorn_read_element(index, forkNum, &tids_copy[j],
-							   NULL, NULL, NULL, &vj);
+							   NULL, NULL, NULL, &vj, NULL);
 			d = acorn_dist(proc, n_vec, vj);
 			pfree(DatumGetPointer(vj));
 			if (d > furthest_d)
@@ -1463,6 +1794,13 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 	OffsetNumber	  entry_offno;
 	int				  entry_level;
 	bool			  has_entry;
+	bool			  payload_on;
+	int				  part;
+	int				  n_payload_real = 0;	/* partition-sourced layer-0 payload slots */
+
+	payload_on = acorn_opt_payload_edges(index) &&
+				 RelationGetDescr(index)->natts > 1;
+	part = acorn_payload_partition(filter_val);
 
 	/* Step 1: assign random level */
 	l_new = acorn_assign_level(m_eff, rand_state);
@@ -1509,11 +1847,78 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 			n_cands = acorn_search_layer_construction(index, forkNum,
 													   ep_blkno, ep_offno,
 													   value, proc, m_eff,
-													   lc, efc, cands);
+													   lc, efc, cands, -1, 0);
 
-			/* Store min(layer_m, n_cands) nearest as E's neighbors at layer lc */
-			for (int i = 0; i < Min(n_cands, layer_m); i++)
-				ntids[start + i] = cands[i].tid;
+			if (lc == 0 && payload_on)
+			{
+				/*
+				 * Split layer-0 slots: first half global nearest, second half
+				 * nearest same-partition nodes found by an ACORN-style
+				 * restricted search (W limited to the partition, exploration
+				 * unrestricted, work capped).
+				 */
+				int			g_half   = layer_m / 2;		/* = m_eff */
+				int			p_half   = layer_m - g_half;
+				int			n_global = Min(n_cands, g_half);
+				int			p_filled = 0;
+				AcornCand  *pcands   = palloc(sizeof(AcornCand) * efc);
+				int			n_part;
+
+				for (int i = 0; i < n_global; i++)
+					ntids[start + i] = cands[i].tid;
+
+				n_part = acorn_search_layer_construction(index, forkNum,
+														  ep_blkno, ep_offno,
+														  value, proc, m_eff,
+														  0, efc, pcands,
+														  part, efc * 8);
+
+				for (int i = 0; i < n_part && p_filled < p_half; i++)
+				{
+					bool dup = false;
+
+					for (int j = 0; j < n_global; j++)
+					{
+						if (ItemPointerEquals(&ntids[start + j], &pcands[i].tid))
+						{
+							dup = true;
+							break;
+						}
+					}
+					if (dup)
+						continue;
+					ntids[start + g_half + p_filled] = pcands[i].tid;
+					p_filled++;
+				}
+				n_payload_real = p_filled;
+
+				/* graceful degradation: backfill with next global candidates */
+				for (int i = g_half; i < n_cands && p_filled < p_half; i++)
+				{
+					bool dup = false;
+
+					for (int j = 0; j < p_filled; j++)
+					{
+						if (ItemPointerEquals(&ntids[start + g_half + j],
+											  &cands[i].tid))
+						{
+							dup = true;
+							break;
+						}
+					}
+					if (dup)
+						continue;
+					ntids[start + g_half + p_filled] = cands[i].tid;
+					p_filled++;
+				}
+				pfree(pcands);
+			}
+			else
+			{
+				/* Store min(layer_m, n_cands) nearest as E's neighbors at lc */
+				for (int i = 0; i < Min(n_cands, layer_m); i++)
+					ntids[start + i] = cands[i].tid;
+			}
 
 			/* Use closest result as entry point for the next (lower) layer */
 			if (n_cands > 0)
@@ -1557,14 +1962,51 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 			int layer_m = HnswGetLayerM(m_eff, lc);
 			int start   = HnswNeighborStart(m_eff, l_new, lc);
 
-			for (int i = 0; i < layer_m; i++)
+			if (lc == 0 && payload_on)
 			{
-				if (!ItemPointerIsValid(&ntids[start + i]))
-					break;
-				acorn_add_reverse_edge_at_layer(index, forkNum,
-												 &ntids[start + i],
-												 e_blk, e_off,
-												 value, proc, m_eff, lc);
+				int g_half = layer_m / 2;
+				int p_half = layer_m - g_half;
+
+				/* global half -> neighbors' global halves */
+				for (int i = 0; i < g_half; i++)
+				{
+					if (!ItemPointerIsValid(&ntids[start + i]))
+						continue;
+					acorn_add_reverse_edge_at_layer(index, forkNum,
+													 &ntids[start + i],
+													 e_blk, e_off,
+													 value, proc, m_eff, lc,
+													 0, g_half, -1);
+				}
+
+				/*
+				 * Partition-sourced payload slots -> neighbors' payload
+				 * halves.  Backfilled global leftovers (i >= n_payload_real)
+				 * stay forward-only.
+				 */
+				for (int i = 0; i < n_payload_real && i < p_half; i++)
+				{
+					if (!ItemPointerIsValid(&ntids[start + g_half + i]))
+						continue;
+					acorn_add_reverse_edge_at_layer(index, forkNum,
+													 &ntids[start + g_half + i],
+													 e_blk, e_off,
+													 value, proc, m_eff, lc,
+													 g_half, p_half, part);
+				}
+			}
+			else
+			{
+				for (int i = 0; i < layer_m; i++)
+				{
+					if (!ItemPointerIsValid(&ntids[start + i]))
+						continue;
+					acorn_add_reverse_edge_at_layer(index, forkNum,
+													 &ntids[start + i],
+													 e_blk, e_off,
+													 value, proc, m_eff, lc,
+													 0, layer_m, -1);
+				}
 			}
 		}
 	}
@@ -1658,6 +2100,8 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 		bs.rand_state[1] = (unsigned short) (MyProcPid >> 16);
 		bs.rand_state[2] = 0x1234;
 		bs.mb = acorn_mem_build_init(build_ctx);
+		/* payload edges need a filter column to partition on */
+		bs.mb->payload_edges = acorn_opt_payload_edges(index) && bs.has_filter;
 
 		if (heap != NULL)
 			reltuples = table_index_build_scan(heap, index, indexInfo, true, true,

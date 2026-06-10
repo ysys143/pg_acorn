@@ -203,14 +203,21 @@ acorn_get_neighbors(Relation index, BlockNumber nbr_blkno, OffsetNumber nbr_offn
 	start = HnswNeighborStart(m, level, layer);
 	count = Min(HnswNeighborCount(m, layer), max_neighbors);
 
-	for (int i = 0; i < count; i++)
+	/*
+	 * Skip (not stop at) invalid slots: with acorn_payload_edges the layer-0
+	 * slot array is split into a global half and a payload half, so a
+	 * partially-filled global half may precede valid payload slots.
+	 */
 	{
-		if (!ItemPointerIsValid(&tids[start + i]))
+		int n = 0;
+
+		for (int i = 0; i < count; i++)
 		{
-			count = i;
-			break;
+			if (!ItemPointerIsValid(&tids[start + i]))
+				continue;
+			neighbors_out[n++] = tids[start + i];
 		}
-		neighbors_out[i] = tids[start + i];
+		count = n;
 	}
 
 	UnlockReleaseBuffer(buf);
