@@ -83,13 +83,14 @@ def main() -> None:
                                            correlation=args.correlation)
     queries = vectors[:args.n_queries]
 
+    # ef_search is now a runtime knob swept per query (scenario A), so the 2-hop
+    # no-op variants are dropped. gamma is the build-time recall knob — sweep it.
     targets = [
         PgvectorTarget(args.dsn),
         PgAcornTarget(args.dsn, tier=1, gamma=1),
         PgAcornTarget(args.dsn, tier=2, gamma=1),
         PgAcornTarget(args.dsn, tier=2, gamma=2),
-        PgAcornTarget(args.dsn, tier=2, gamma=1, enable_2hop=True),
-        PgAcornTarget(args.dsn, tier=2, gamma=2, enable_2hop=True),
+        PgAcornTarget(args.dsn, tier=2, gamma=4),
     ]
     if args.qdrant:
         targets.append(QdrantTarget(args.qdrant))
