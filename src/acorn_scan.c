@@ -41,6 +41,15 @@ typedef struct AcornElem
 	ItemPointerData indextid;	/* index page (blkno, offno) */
 	ItemPointerData heaptid;	/* heap TID — for predicate evaluation */
 	double			distance;
+
+	/*
+	 * T2 single-read fast path: neighbor-tuple location + level captured at
+	 * discovery (acorn_t2_load_node), so expansion does not re-read the
+	 * element page.  Valid only when has_nbr; tier 1 paths leave it false.
+	 */
+	ItemPointerData nbrtid;		/* index TID of the node's neighbor tuple */
+	uint8			level;		/* node's highest layer */
+	bool			has_nbr;	/* nbrtid/level above are valid */
 } AcornElem;
 
 /* -----------------------------------------------------------------------
@@ -961,8 +970,8 @@ acorn_t2_load_node(AcornT2StreamScan *s,
 				   ItemPointerData *heaptid_out,
 				   bool            *deleted_out,
 				   int64           *filter_val_out,
-				   BlockNumber     *nbr_blkno_out,
-				   OffsetNumber    *nbr_offno_out)
+				   ItemPointerData *nbrtid_out,
+				   uint8           *level_out)
 {
 	Buffer				buf;
 	Page				page;
@@ -980,10 +989,10 @@ acorn_t2_load_node(AcornT2StreamScan *s,
 	*heaptid_out    = etup->heaptids[0];
 	*deleted_out    = (etup->deleted != 0);
 	*filter_val_out = etup->filter_val;
-	if (nbr_blkno_out)
-		*nbr_blkno_out  = ItemPointerGetBlockNumber(&etup->neighbortid);
-	if (nbr_offno_out)
-		*nbr_offno_out  = ItemPointerGetOffsetNumber(&etup->neighbortid);
+	if (nbrtid_out)
+		*nbrtid_out = etup->neighbortid;
+	if (level_out)
+		*level_out  = etup->level;
 
 	UnlockReleaseBuffer(buf);
 	return dist;
@@ -1085,20 +1094,35 @@ static void
 acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 {
 	ItemPointerData neighbors[HNSW_MAX_NEIGHBORS];
-	ItemPointerData ce_heaptid;
 	int				ce_level;
-	bool			ce_deleted;
 	BlockNumber		nbr_blkno;
 	OffsetNumber	nbr_offno;
-	Buffer			ebuf;
 	int				n_count;
 
-	ebuf = acorn_t2_load_element(s->index,
-								  ItemPointerGetBlockNumber(&ce->indextid),
-								  ItemPointerGetOffsetNumber(&ce->indextid),
-								  &ce_heaptid, &ce_level, &ce_deleted,
-								  &nbr_blkno, &nbr_offno, NULL);
-	UnlockReleaseBuffer(ebuf);
+	if (ce->has_nbr)
+	{
+		/*
+		 * Single-read fast path: neighbor-tuple location + level were
+		 * captured when this node's element page was read at discovery —
+		 * no element page re-read here.
+		 */
+		ce_level  = (int) ce->level;
+		nbr_blkno = ItemPointerGetBlockNumber(&ce->nbrtid);
+		nbr_offno = ItemPointerGetOffsetNumber(&ce->nbrtid);
+	}
+	else
+	{
+		ItemPointerData ce_heaptid;
+		bool			ce_deleted;
+		Buffer			ebuf;
+
+		ebuf = acorn_t2_load_element(s->index,
+									  ItemPointerGetBlockNumber(&ce->indextid),
+									  ItemPointerGetOffsetNumber(&ce->indextid),
+									  &ce_heaptid, &ce_level, &ce_deleted,
+									  &nbr_blkno, &nbr_offno, NULL);
+		UnlockReleaseBuffer(ebuf);
+	}
 
 	n_count = acorn_get_neighbors(s->index, nbr_blkno, nbr_offno,
 								   ce_level, 0, s->m, neighbors,
@@ -1145,6 +1169,8 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 		ItemPointerData nheaptid;
 		bool			ndeleted;
 		int64			nfilter_val;
+		ItemPointerData n_nbrtid;
+		uint8			n_level;
 		AcornPQNode	   *cn;
 
 		if (!ItemPointerIsValid(&neighbors[i]))
@@ -1158,13 +1184,21 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 
 		nd = acorn_t2_load_node(s, nblkno, noffno,
 								 &nheaptid, &ndeleted, &nfilter_val,
-								 NULL, NULL);
+								 &n_nbrtid, &n_level);
 
 		/* Always add to C — ACORN invariant: preserve connectivity */
 		cn = palloc(sizeof(AcornPQNode));
 		ItemPointerCopy(&neighbors[i], &cn->elem.indextid);
 		ItemPointerSetInvalid(&cn->elem.heaptid);
 		cn->elem.distance = nd;
+		if (acorn_scan_single_read)
+		{
+			ItemPointerCopy(&n_nbrtid, &cn->elem.nbrtid);
+			cn->elem.level   = n_level;
+			cn->elem.has_nbr = true;
+		}
+		else
+			cn->elem.has_nbr = false;
 		pairingheap_add(s->C, &cn->ph_node);
 
 		if (ndeleted)
@@ -1239,6 +1273,8 @@ acorn_t2_stream_begin(Relation index, Datum query,
 		ItemPointerData heaptid;
 		bool			deleted;
 		int64			fval;
+		ItemPointerData nbrtid;
+		uint8			level;
 		double			d;
 		AcornPQNode	   *cn;
 
@@ -1246,12 +1282,20 @@ acorn_t2_stream_begin(Relation index, Datum query,
 		mark_visited(s->visited, &entry_tid);
 
 		d = acorn_t2_load_node(s, entry_blkno, entry_offno,
-							   &heaptid, &deleted, &fval, NULL, NULL);
+							   &heaptid, &deleted, &fval, &nbrtid, &level);
 
 		cn = palloc(sizeof(AcornPQNode));
 		ItemPointerCopy(&entry_tid, &cn->elem.indextid);
 		ItemPointerSetInvalid(&cn->elem.heaptid);
 		cn->elem.distance = d;
+		if (acorn_scan_single_read)
+		{
+			ItemPointerCopy(&nbrtid, &cn->elem.nbrtid);
+			cn->elem.level   = level;
+			cn->elem.has_nbr = true;
+		}
+		else
+			cn->elem.has_nbr = false;
 		pairingheap_add(s->C, &cn->ph_node);
 
 		if (!deleted && acorn_t2_eval_filter(keys, nkeys, fval))

@@ -11,8 +11,9 @@ extern int  acorn_default_gamma;
 extern bool acorn_enable_2hop;
 extern int  acorn_ef_search;
 
-/* Tier 2 scan fast-path toggles (debug/benchmark; default on) */
+/* Tier 2 scan fast-path toggles (debug/benchmark) */
 extern bool acorn_scan_direct_dist;
 extern bool acorn_scan_prefetch;
+extern bool acorn_scan_single_read;
 
 #endif /* PG_ACORN_H */

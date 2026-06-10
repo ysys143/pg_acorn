@@ -39,6 +39,12 @@ bool acorn_scan_direct_dist = true;
  */
 bool acorn_scan_prefetch = false;
 
+/*
+ * GUC: Tier 2 scan fast-path toggle — carry neighbor-tuple location + level
+ * in the candidate queue so expansion does not re-read the element page.
+ */
+bool acorn_scan_single_read = true;
+
 void _PG_init(void);
 void _PG_fini(void);
 
@@ -122,6 +128,20 @@ _PG_init(void)
 		NULL,
 		&acorn_scan_prefetch,
 		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_single_read */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_single_read",
+		"Capture neighbor-tuple location at node discovery so acorn_hnsw "
+		"scan expansion does not re-read the element page (debug/benchmark; "
+		"results identical).",
+		NULL,
+		&acorn_scan_single_read,
+		true,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL
