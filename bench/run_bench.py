@@ -67,10 +67,20 @@ def main() -> None:
     parser.add_argument("--dim", type=int, default=96)
     parser.add_argument("--n-vectors", type=int, default=50_000)
     parser.add_argument("--n-queries", type=int, default=100)
+    parser.add_argument("--fixture", choices=["sift", "synthetic"], default="synthetic",
+                        help="vector source (synthetic = controllable filter-vector correlation)")
+    parser.add_argument("--correlation", choices=["low", "high"], default="low",
+                        help="synthetic only: low = adversarial (bucket independent of vector), "
+                             "high = filter aligned with vector space")
     args = parser.parse_args()
 
-    print(f"Loading fixtures (dim={args.dim}, n={args.n_vectors})...")
-    vectors, metadata = load_sift(n=args.n_vectors, dim=args.dim)
+    print(f"Loading fixtures ({args.fixture}, dim={args.dim}, n={args.n_vectors}"
+          + (f", correlation={args.correlation}" if args.fixture == "synthetic" else "") + ")...")
+    if args.fixture == "sift":
+        vectors, metadata = load_sift(n=args.n_vectors, dim=args.dim)
+    else:
+        vectors, metadata = load_synthetic(n=args.n_vectors, dim=args.dim,
+                                           correlation=args.correlation)
     queries = vectors[:args.n_queries]
 
     targets = [

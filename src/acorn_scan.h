@@ -75,6 +75,7 @@ AcornT2StreamScan *acorn_t2_stream_begin(Relation index,
 										  Datum query_vec,
 										  ScanKey keys,
 										  int nkeys,
+										  int ef_search,
 										  Snapshot snapshot,
 										  MemoryContext mcxt);
 

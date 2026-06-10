@@ -24,6 +24,9 @@ int acorn_default_gamma = ACORN_DEFAULT_GAMMA;
 /* GUC: enable 2-hop expansion for in-filter scans (experimental) */
 bool acorn_enable_2hop = false;
 
+/* GUC: runtime ef_search cap for acorn_hnsw (Tier 2) streaming scans */
+int acorn_ef_search = ACORN_DEFAULT_EF_SEARCH;
+
 void _PG_init(void);
 void _PG_fini(void);
 
@@ -63,6 +66,21 @@ _PG_init(void)
 		NULL,
 		&acorn_enable_2hop,
 		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.ef_search */
+	DefineCustomIntVariable(
+		"pg_acorn.ef_search",
+		"Candidate list size (ef) for acorn_hnsw Tier 2 streaming scans. "
+		"Higher values raise recall at the cost of more page reads.",
+		NULL,
+		&acorn_ef_search,
+		ACORN_DEFAULT_EF_SEARCH,	/* default */
+		1,							/* min */
+		1000,						/* max */
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL

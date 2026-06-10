@@ -1,0 +1,98 @@
+-- tier2_ef_search.sql: runtime ef_search expansion-budget cap for the tier2
+-- acorn_hnsw streaming scan.
+--
+-- pg_acorn.ef_search bounds the number of node expansions per scan: it is the
+-- recall/latency knob (more expansions explore more of the predicate subgraph).
+-- Tests: GUC existence/settability, filter correctness across ef values, recall
+-- monotonicity vs an exact seqscan ground truth, and default-value behavior.
+--
+-- Monotonicity is guaranteed by construction: on a fixed index the best-first
+-- traversal is deterministic, so a larger budget expands a superset of the nodes
+-- a smaller budget does — recall is therefore non-decreasing in ef_search,
+-- independent of the (random) data and graph.  Absolute recall is NOT asserted:
+-- on this small adversarial fixture even a large budget stays well below 1.0.
+
+\set ON_ERROR_STOP on
+\set q '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'
+
+CREATE SCHEMA test_tier2_ef;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+SET search_path = test_tier2_ef, public;
+
+-- 2000 rows, 10 buckets → bucket < 1 = ~10% selectivity (~200 rows)
+SELECT setseed(0.42);
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    bucket    int,
+    embedding vector(8)
+);
+
+INSERT INTO items (bucket, embedding) SELECT
+    (i % 10),
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 2000) i;
+
+CREATE INDEX items_acorn_mc ON items
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2);
+
+-- GUC must exist and be settable (errors before this feature is implemented)
+SET pg_acorn.ef_search = 100;
+SHOW pg_acorn.ef_search;
+
+-- Exact ground truth: top-10 filtered KNN via seqscan (no index).
+SET enable_seqscan = on;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TABLE truth AS
+    SELECT id FROM items WHERE bucket < 1
+    ORDER BY embedding <=> :'q'::vector LIMIT 10;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
+-- ACORN recall at a given ef_search: overlap of index result with exact truth.
+CREATE OR REPLACE FUNCTION acorn_recall(ef int) RETURNS numeric AS $$
+DECLARE
+    matched int;
+BEGIN
+    EXECUTE format('SET pg_acorn.ef_search = %s', ef);
+    SET enable_seqscan = off;
+    WITH acorn_r AS (
+        SELECT id FROM items WHERE bucket < 1
+        ORDER BY embedding <=> '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'::vector LIMIT 10
+    )
+    SELECT count(*) INTO matched FROM acorn_r JOIN truth USING (id);
+    RESET enable_seqscan;
+    RETURN matched / 10.0;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Filter correctness must hold at every ef_search value.
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 10;
+SELECT bool_and(bucket < 5) AS filter_correct_ef10
+FROM (SELECT bucket FROM items WHERE bucket < 5
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+SET pg_acorn.ef_search = 400;
+SELECT bool_and(bucket < 5) AS filter_correct_ef400
+FROM (SELECT bucket FROM items WHERE bucket < 5
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+RESET enable_seqscan;
+
+-- Recall monotonicity: a larger expansion budget never lowers recall.
+SELECT acorn_recall(40)  >= acorn_recall(10) AS mono_low;
+SELECT acorn_recall(400) >= acorn_recall(40) AS mono_high;
+
+-- Default ef_search (reset) still returns a full k result set.
+RESET pg_acorn.ef_search;
+SET enable_seqscan = off;
+SELECT count(*) = 10 AS default_ef_returns_k
+FROM (SELECT id FROM items WHERE bucket < 5
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+RESET enable_seqscan;
+
+DROP SCHEMA test_tier2_ef CASCADE;

@@ -820,6 +820,8 @@ struct AcornT2StreamScan
 	FmgrInfo		dist_proc;
 	Datum			query;
 	int				m;
+	int				ef_search;		/* expansion budget: max node expansions */
+	int				n_expansions;	/* expansions used so far */
 	pairingheap	   *C;			/* candidates to expand (min-heap) */
 	pairingheap	   *R;			/* discovered passing nodes, awaiting emit */
 	HTAB		   *visited;
@@ -1096,7 +1098,7 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 
 AcornT2StreamScan *
 acorn_t2_stream_begin(Relation index, Datum query,
-					   ScanKey keys, int nkeys,
+					   ScanKey keys, int nkeys, int ef_search,
 					   Snapshot snapshot, MemoryContext mcxt)
 {
 	MemoryContext		old = MemoryContextSwitchTo(mcxt);
@@ -1109,12 +1111,14 @@ acorn_t2_stream_begin(Relation index, Datum query,
 
 	(void) snapshot;			/* visibility handled by executor post-fetch */
 
-	s->index     = index;
-	s->query     = query;
-	s->mcxt      = mcxt;
-	s->keys      = keys;
-	s->nkeys     = nkeys;
-	s->exhausted = false;
+	s->index        = index;
+	s->query        = query;
+	s->mcxt         = mcxt;
+	s->keys         = keys;
+	s->nkeys        = nkeys;
+	s->ef_search    = ef_search;
+	s->n_expansions = 0;
+	s->exhausted    = false;
 	acorn_load_dist_proc(index, &s->dist_proc);
 
 	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m))
@@ -1129,8 +1133,8 @@ acorn_t2_stream_begin(Relation index, Datum query,
 		acorn_t2_greedy_descent(index, m, &entry_blkno, &entry_offno,
 								 entry_level, 0, query, &s->dist_proc);
 
-	s->C = pairingheap_allocate(pq_cmp_min, NULL);
-	s->R = pairingheap_allocate(pq_cmp_min, NULL);
+	s->C = pairingheap_allocate(pq_cmp_min, NULL);	/* candidates, nearest-first */
+	s->R = pairingheap_allocate(pq_cmp_min, NULL);	/* results, nearest-first */
 
 	memset(&info, 0, sizeof(info));
 	info.keysize   = sizeof(ItemPointerData);
@@ -1175,6 +1179,23 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	return s;
 }
 
+/*
+ * Emit the next nearest filter-passing heap TID, expanding the frontier lazily.
+ *
+ * Pops the nearest candidate from C and expands it; filter-failing nodes stay in
+ * C for connectivity while passing nodes go to R.  The executor post-filters and
+ * keeps pulling until its LIMIT is satisfied.
+ *
+ * ef_search bounds the number of node expansions (the work budget).  While the
+ * budget remains, the scan explores best-first and only emits a result once no
+ * unexpanded candidate is closer (exact ordering).  Once the budget is spent it
+ * stops exploring and drains the discovered results in nearest-first order.
+ * Larger ef_search explores more of the predicate subgraph — higher recall and
+ * more page reads; smaller ef_search stops sooner.  This is the counted
+ * candidate budget that the Tier 1 bounded search (acorn_layer0_search) deferred
+ * to Tier 2: it works where the standard "nearest candidate beyond worst result"
+ * HNSW termination does not, because ACORN keeps near filter-failing nodes in C.
+ */
 bool
 acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 {
@@ -1192,12 +1213,16 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 		double c_dist = pairingheap_is_empty(s->C) ? DBL_MAX
 			: ((AcornPQNode *) pairingheap_first(s->C))->elem.distance;
 
-		if (!pairingheap_is_empty(s->C) && c_dist <= r_dist)
+		/* Explore while a candidate may still beat the nearest result, but only
+		 * within the ef_search expansion budget. */
+		if (!pairingheap_is_empty(s->C) && c_dist <= r_dist
+			&& s->n_expansions < s->ef_search)
 		{
 			AcornPQNode *cn = (AcornPQNode *) pairingheap_remove_first(s->C);
 			AcornElem	 ce = cn->elem;
 			pfree(cn);
 			acorn_t2_stream_expand(s, &ce);
+			s->n_expansions++;
 			continue;
 		}
 

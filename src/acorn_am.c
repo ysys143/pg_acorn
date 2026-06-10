@@ -133,17 +133,16 @@ acorn_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 }
 
 /*
- * acorn_gettuple — iterative scan with ef expansion.
+ * acorn_gettuple — bounded ACORN streaming scan.
  *
- * On the first call, search with ef = ACORN_DEFAULT_EF_SEARCH (40) and
- * buffer the results.  Return heap TIDs one at a time to the executor,
- * which post-filters on the WHERE predicate.  When the buffer is exhausted
- * before the executor stops asking, double ef and search again, skipping TIDs
- * already returned (tracked in so->seen).  Stop when ef >= ACORN_EF_SEARCH_MAX
- * or an expansion produces no new TIDs.
+ * On the first call, acorn_t2_stream_begin sets up the frontier and the first
+ * acorn_t2_stream_next runs a single bounded best-first traversal capped at
+ * pg_acorn.ef_search (the GUC acorn_ef_search), materializing the ef_search
+ * closest filter-passing nodes.  Subsequent calls emit those heap TIDs one at
+ * a time in nearest-first order until the executor's LIMIT is met.
  *
- * This lifts Tier 2 recall at low selectivity: at 1% selectivity with k=10
- * the executor needs ~1000 candidates, requiring ~5 doublings from ef=40.
+ * ef_search is the recall/latency knob (mirrors hnsw.ef_search): raise it to
+ * explore more of the graph at low selectivity, lower it for fewer page reads.
  */
 static bool
 acorn_gettuple(IndexScanDesc scan, ScanDirection dir)
@@ -173,6 +172,7 @@ acorn_gettuple(IndexScanDesc scan, ScanDirection dir)
 			PG_DETOAST_DATUM(scan->orderByData->sk_argument));
 		so->stream = acorn_t2_stream_begin(scan->indexRelation, so->query,
 										   scan->keyData, scan->numberOfKeys,
+										   acorn_ef_search,
 										   scan->xs_snapshot, so->tmpCtx);
 		so->first = false;
 
