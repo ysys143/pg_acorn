@@ -88,6 +88,28 @@ same-partition edges let it drain the predicate subgraph directly
 (measured: recall 1.0 at ef_search=100, ~2 ms median on a 20k/128d 1%
 filter, vs 0.94 at ef_search=400 and ~24 ms without).
 
+`acorn_inline_vectors` (bool, default `false`): vector co-location.  Each
+layer-0 neighbor slot additionally stores an SQ8-quantized copy of the
+target's vector (1 byte/dim, per-vector scale/offset) plus its heap TID,
+filter value, deleted flag, and neighbor-list pointer.  The scan then
+discovers and filters neighbors from the neighbor list itself — one
+expansion touches ~2 pages instead of ~1 page per discovered neighbor —
+and re-ranks emitted results with exact distances (element-page read per
+emitted/border candidate, 40-deep window).  Trade-offs: the index grows by
+`2*m*gamma * (40 + dim)` bytes per node (~11x at dim=128, gamma=2), and
+inserts re-read neighbor element pages to keep co-located entries in sync
+(correct-first; a torn update degrades that edge to the classic read path,
+never to a wrong result).  Requires a fixed-dimension vector column.  The
+layout is recorded in the index meta page at build time; set
+`pg_acorn.scan_inline_vectors = off` to force the classic scan path on an
+inline index (A/B debugging).
+
+```sql
+CREATE INDEX ON items USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+  WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+        acorn_payload_edges = true, acorn_inline_vectors = true);
+```
+
 Note on drivers: bind small integer filter constants carefully — the
 operator family includes cross-type (int2/int8) comparisons so quals like
 `bucket < $1::smallint` (psycopg's default int binding) still push down as
