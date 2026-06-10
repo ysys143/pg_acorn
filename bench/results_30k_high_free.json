@@ -1,0 +1,430 @@
+{
+  "prefilter_exact": {
+    "a": {
+      "1": {
+        "null": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 79.01841453570246,
+          "p99_ms": 263.2051246659835,
+          "pages_total_mean": 1509.0,
+          "pages_hit_mean": 1509.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        }
+      },
+      "5": {
+        "null": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 95.14273255502394,
+          "p99_ms": 232.11734577897028,
+          "pages_total_mean": 1509.0,
+          "pages_hit_mean": 1509.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        }
+      },
+      "10": {
+        "null": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 63.94884499884342,
+          "p99_ms": 232.24731433088922,
+          "pages_total_mean": 1979.0,
+          "pages_hit_mean": 1979.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        }
+      },
+      "40": {
+        "null": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 23.516253580025904,
+          "p99_ms": 352.15222459635714,
+          "pages_total_mean": 2154.0,
+          "pages_hit_mean": 2154.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        }
+      },
+      "80": {
+        "null": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 27.182431376769916,
+          "p99_ms": 298.18782752729027,
+          "pages_total_mean": 2176.0,
+          "pages_hit_mean": 2176.0,
+          "pages_read_mean": 0.0,
+          "plan": "Seq Scan"
+        }
+      }
+    }
+  },
+  "pgvector": {
+    "a": {
+      "1": {
+        "10": {
+          "recall_mean": 0.07899999999999999,
+          "recall_min": 0.0,
+          "qps": 122.88961213074407,
+          "p99_ms": 132.4589359585664,
+          "pages_total_mean": 547.1,
+          "pages_hit_mean": 547.1,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "40": {
+          "recall_mean": 0.31299999999999994,
+          "recall_min": 0.0,
+          "qps": 56.08091013472659,
+          "p99_ms": 215.39242163300517,
+          "pages_total_mean": 1439.2,
+          "pages_hit_mean": 1439.2,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "100": {
+          "recall_mean": 0.611,
+          "recall_min": 0.2,
+          "qps": 104.02143261517102,
+          "p99_ms": 131.13188260933455,
+          "pages_total_mean": 3152.85,
+          "pages_hit_mean": 3152.85,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "200": {
+          "recall_mean": 0.7369999999999999,
+          "recall_min": 0.5,
+          "qps": 34.07145230884393,
+          "p99_ms": 273.8323388795835,
+          "pages_total_mean": 5733.7,
+          "pages_hit_mean": 5733.7,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "400": {
+          "recall_mean": 0.8740000000000001,
+          "recall_min": 0.6,
+          "qps": 30.630689825807423,
+          "p99_ms": 278.49161650287004,
+          "pages_total_mean": 9976.55,
+          "pages_hit_mean": 9976.55,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "800": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 89.18074620607025,
+          "p99_ms": 189.20884194434623,
+          "pages_total_mean": 1510.0,
+          "pages_hit_mean": 1510.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        },
+        "1600": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 71.2215985889222,
+          "p99_ms": 180.79685483127847,
+          "pages_total_mean": 1510.0,
+          "pages_hit_mean": 1510.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        }
+      },
+      "5": {
+        "10": {
+          "recall_mean": 0.07899999999999999,
+          "recall_min": 0.0,
+          "qps": 284.487302478581,
+          "p99_ms": 4.5925649907452835,
+          "pages_total_mean": 547.1,
+          "pages_hit_mean": 547.1,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "40": {
+          "recall_mean": 0.31299999999999994,
+          "recall_min": 0.0,
+          "qps": 141.79791454330686,
+          "p99_ms": 99.64056899771107,
+          "pages_total_mean": 1439.2,
+          "pages_hit_mean": 1439.2,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "100": {
+          "recall_mean": 0.611,
+          "recall_min": 0.2,
+          "qps": 65.74646612950689,
+          "p99_ms": 251.00666375365134,
+          "pages_total_mean": 3152.85,
+          "pages_hit_mean": 3152.85,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "200": {
+          "recall_mean": 0.7369999999999999,
+          "recall_min": 0.5,
+          "qps": 53.680643289140605,
+          "p99_ms": 278.56287520262424,
+          "pages_total_mean": 5733.7,
+          "pages_hit_mean": 5733.7,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "400": {
+          "recall_mean": 0.8740000000000001,
+          "recall_min": 0.6,
+          "qps": 33.233101132171356,
+          "p99_ms": 333.2111339084807,
+          "pages_total_mean": 9976.55,
+          "pages_hit_mean": 9976.55,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "800": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 107.55224035018338,
+          "p99_ms": 71.31502392469042,
+          "pages_total_mean": 1510.0,
+          "pages_hit_mean": 1510.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        },
+        "1600": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 82.32937803025276,
+          "p99_ms": 137.70307190949123,
+          "pages_total_mean": 1510.0,
+          "pages_hit_mean": 1510.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        }
+      },
+      "10": {
+        "10": {
+          "recall_mean": 0.16600000000000004,
+          "recall_min": 0.0,
+          "qps": 274.32397222795134,
+          "p99_ms": 28.05440807482252,
+          "pages_total_mean": 547.1,
+          "pages_hit_mean": 547.1,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "40": {
+          "recall_mean": 0.601,
+          "recall_min": 0.2,
+          "qps": 113.6102709488613,
+          "p99_ms": 161.2728652555963,
+          "pages_total_mean": 1438.55,
+          "pages_hit_mean": 1438.55,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "100": {
+          "recall_mean": 0.745,
+          "recall_min": 0.4,
+          "qps": 98.88393594425199,
+          "p99_ms": 255.16711667995,
+          "pages_total_mean": 3120.85,
+          "pages_hit_mean": 3120.85,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "200": {
+          "recall_mean": 0.8400000000000002,
+          "recall_min": 0.5,
+          "qps": 67.82592411552672,
+          "p99_ms": 187.2045219049327,
+          "pages_total_mean": 5680.7,
+          "pages_hit_mean": 5680.7,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "400": {
+          "recall_mean": 0.9310000000000003,
+          "recall_min": 0.7,
+          "qps": 28.489128156197015,
+          "p99_ms": 314.71876512281597,
+          "pages_total_mean": 9916.05,
+          "pages_hit_mean": 9916.05,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "800": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 58.5649012707313,
+          "p99_ms": 237.99472696962778,
+          "pages_total_mean": 1980.0,
+          "pages_hit_mean": 1980.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        },
+        "1600": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 45.58939041601495,
+          "p99_ms": 230.2684542990756,
+          "pages_total_mean": 1980.0,
+          "pages_hit_mean": 1980.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        }
+      },
+      "40": {
+        "10": {
+          "recall_mean": 0.3939999999999999,
+          "recall_min": 0.0,
+          "qps": 106.96994205299474,
+          "p99_ms": 210.8710376510863,
+          "pages_total_mean": 547.1,
+          "pages_hit_mean": 547.1,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "40": {
+          "recall_mean": 0.748,
+          "recall_min": 0.3,
+          "qps": 105.66616760126996,
+          "p99_ms": 129.79661184363093,
+          "pages_total_mean": 1425.1,
+          "pages_hit_mean": 1425.1,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "100": {
+          "recall_mean": 0.8200000000000002,
+          "recall_min": 0.4,
+          "qps": 59.61460286684099,
+          "p99_ms": 277.5009385473095,
+          "pages_total_mean": 3085.2,
+          "pages_hit_mean": 3085.2,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "200": {
+          "recall_mean": 0.8840000000000002,
+          "recall_min": 0.6,
+          "qps": 42.47239302381758,
+          "p99_ms": 289.5644009578973,
+          "pages_total_mean": 5645.0,
+          "pages_hit_mean": 5645.0,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "400": {
+          "recall_mean": 0.953,
+          "recall_min": 0.8,
+          "qps": 32.229414087099705,
+          "p99_ms": 321.1082135490145,
+          "pages_total_mean": 9880.65,
+          "pages_hit_mean": 9880.65,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "800": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 28.54923195998333,
+          "p99_ms": 302.1577237453329,
+          "pages_total_mean": 2155.0,
+          "pages_hit_mean": 2155.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        },
+        "1600": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 28.26244542519879,
+          "p99_ms": 312.8211553581061,
+          "pages_total_mean": 2155.0,
+          "pages_hit_mean": 2155.0,
+          "pages_read_mean": 0.0,
+          "plan": "Bitmap Heap Scan"
+        }
+      },
+      "80": {
+        "10": {
+          "recall_mean": 0.7319999999999999,
+          "recall_min": 0.0,
+          "qps": 246.95967198204355,
+          "p99_ms": 61.21129034203524,
+          "pages_total_mean": 547.1,
+          "pages_hit_mean": 547.1,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "40": {
+          "recall_mean": 0.801,
+          "recall_min": 0.4,
+          "qps": 169.15144017001987,
+          "p99_ms": 161.54891713755208,
+          "pages_total_mean": 1411.25,
+          "pages_hit_mean": 1411.25,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "100": {
+          "recall_mean": 0.8610000000000002,
+          "recall_min": 0.6,
+          "qps": 100.69605411384883,
+          "p99_ms": 176.0392268165015,
+          "pages_total_mean": 3072.2,
+          "pages_hit_mean": 3072.2,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "200": {
+          "recall_mean": 0.9190000000000002,
+          "recall_min": 0.6,
+          "qps": 44.23813050619131,
+          "p99_ms": 255.10286793345594,
+          "pages_total_mean": 5631.1,
+          "pages_hit_mean": 5631.1,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "400": {
+          "recall_mean": 0.9680000000000001,
+          "recall_min": 0.8,
+          "qps": 26.401019132684198,
+          "p99_ms": 279.0693928510884,
+          "pages_total_mean": 9866.6,
+          "pages_hit_mean": 9866.6,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "800": {
+          "recall_mean": 0.992,
+          "recall_min": 0.8,
+          "qps": 10.697168779380847,
+          "p99_ms": 274.382908679545,
+          "pages_total_mean": 16097.65,
+          "pages_hit_mean": 16097.65,
+          "pages_read_mean": 0.0,
+          "plan": "Index Scan"
+        },
+        "1600": {
+          "recall_mean": 1.0,
+          "recall_min": 1.0,
+          "qps": 41.278445930960295,
+          "p99_ms": 254.89268630393786,
+          "pages_total_mean": 2177.0,
+          "pages_hit_mean": 2177.0,
+          "pages_read_mean": 0.0,
+          "plan": "Seq Scan"
+        }
+      }
+    }
+  }
+}

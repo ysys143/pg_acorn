@@ -27,14 +27,16 @@ def brute_force(target, query: np.ndarray, bucket_threshold: int, k: int) -> lis
     return target.query_filtered(query, bucket_threshold, k)
 
 
-def run(target, queries: np.ndarray, ground_truth: dict) -> dict:
+def run(target, queries: np.ndarray, ground_truth: dict, force_index: bool = True) -> dict:
     results = {}
 
-    # Force the vector index: with a small table at low selectivity the planner
-    # may pick a seq scan, which makes pages_per_query (and recall) reflect the
-    # scan, not the index. Forcing it keeps every target on its index for an
-    # apples-to-apples comparison. Ground truth uses a separate connection.
-    force = getattr(target, "force_index_scan", None)
+    # force_index=True pins each target on its vector index (apples-to-apples
+    # index comparison). force_index=False (--free-planner) lets the planner
+    # choose freely — e.g. a bitmap prefilter on the filter column at high
+    # selectivity — which is the realistic, production behavior and the regime
+    # where the exact-fallback lever shows up. Ground truth uses a separate
+    # connection and is unaffected.
+    force = getattr(target, "force_index_scan", None) if force_index else None
     if force:
         force(True)
     try:

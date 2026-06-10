@@ -52,6 +52,10 @@ class PgAcornTarget:
                     f"SET pg_acorn.enable_2hop = {'on' if self.enable_2hop else 'off'}"
                 )
 
+            # btree on the filter column so a free planner can choose a bitmap
+            # prefilter (exact) instead of the acorn_hnsw scan at high selectivity.
+            cur.execute("CREATE INDEX ON bench_items (bucket)")
+
     def query_filtered(self, query: np.ndarray, bucket_threshold: int, k: int) -> list[int]:
         with self.conn.cursor() as cur:
             cur.execute(

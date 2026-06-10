@@ -73,6 +73,9 @@ def main() -> None:
     parser.add_argument("--correlation", choices=["low", "high"], default="low",
                         help="synthetic only: low = adversarial (bucket independent of vector), "
                              "high = filter aligned with vector space")
+    parser.add_argument("--free-planner", action="store_true",
+                        help="don't force the vector index; let the planner pick prefilter/HNSW "
+                             "per query (realistic) — exposes the exact-fallback lever")
     args = parser.parse_args()
 
     print(f"Loading fixtures ({args.fixture}, dim={args.dim}, n={args.n_vectors}"
@@ -125,8 +128,10 @@ def main() -> None:
             target_results: dict = {}
 
             if "a" in run_scenarios:
-                print(f"[{target.name}] scenario A: selectivity sweep")
-                target_results["a"] = a_selectivity_sweep.run(target, queries, truth)
+                print(f"[{target.name}] scenario A: selectivity sweep"
+                      + (" (free planner)" if args.free_planner else ""))
+                target_results["a"] = a_selectivity_sweep.run(
+                    target, queries, truth, force_index=not args.free_planner)
 
             if "b" in run_scenarios and target.name == "pgvector":
                 print(f"[{target.name}] scenario B: post-filter recall")

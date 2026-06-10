@@ -37,6 +37,9 @@ class PgvectorTarget:
                 USING hnsw (embedding vector_cosine_ops)
                 WITH (m = 16, ef_construction = 64)
             """)
+            # btree on the filter column so a free planner can choose a bitmap
+            # prefilter (exact) over the HNSW postfilter at high selectivity.
+            cur.execute("CREATE INDEX ON bench_items (bucket)")
 
     def query_filtered(self, query: np.ndarray, bucket_threshold: int, k: int) -> list[int]:
         with self.conn.cursor() as cur:
