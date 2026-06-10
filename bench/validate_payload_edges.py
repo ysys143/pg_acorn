@@ -41,6 +41,13 @@ DSN = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
 # is navigable only through payload edges).
 CORR = os.environ.get("CORR", "high")
 
+# MF=off|on|both: pg_acorn.member_first scan GUC sweep.  member_first spends
+# the ef_search budget on filter-passing candidates first (pairs with
+# acorn_payload_edges indexes whose same-partition edges keep the predicate
+# subgraph connected).
+MF = os.environ.get("MF", "off")
+MF_MODES = ["off", "on"] if MF == "both" else [MF]
+
 N, DIM, NQ, K = 20000, 128, 30, 10
 EFS = [40, 100, 200, 400]
 SELS = [1, 40]                       # bucket < sel  =>  ~sel% selectivity
@@ -112,41 +119,45 @@ for name, gamma, payload in CONFIGS:
                               acorn_payload_edges = {payload})""")
         print(f"  built in {time.perf_counter() - t0:.1f}s", flush=True)
 
-    for sel in SELS:
-        truths = [exact_truth(q, sel, K) for q in queries]
-        for ef in EFS:
-            recalls, lats = [], []
-            with conn.cursor() as cur:
-                cur.execute("SET enable_seqscan = off")
-                cur.execute(f"SET pg_acorn.ef_search = {ef}")
-                for q, truth in zip(queries, truths):
-                    t0 = time.perf_counter()
-                    cur.execute(
-                        "SELECT id FROM pe_items WHERE bucket < %s "
-                        "ORDER BY embedding <=> %s::vector LIMIT %s",
-                        (sel, qstr(q), K))
-                    ids = {r[0] for r in cur.fetchall()}
-                    lats.append((time.perf_counter() - t0) * 1000.0)
-                    recalls.append(len(ids & truth) / K)
-            rec = float(np.mean(recalls))
-            med = float(np.median(lats))
-            p90 = float(np.percentile(lats, 90))
-            results.append((name, sel, ef, rec, med, p90))
-            print(f"  {name:7s} sel={sel:>2}%  ef={ef:>4}  "
-                  f"recall={rec:.3f}  med={med:.2f}ms  p90={p90:.2f}ms",
-                  flush=True)
+    for mf in MF_MODES:
+        for sel in SELS:
+            truths = [exact_truth(q, sel, K) for q in queries]
+            for ef in EFS:
+                recalls, lats = [], []
+                with conn.cursor() as cur:
+                    cur.execute("SET enable_seqscan = off")
+                    cur.execute(f"SET pg_acorn.ef_search = {ef}")
+                    cur.execute(f"SET pg_acorn.member_first = {mf}")
+                    for q, truth in zip(queries, truths):
+                        t0 = time.perf_counter()
+                        cur.execute(
+                            "SELECT id FROM pe_items WHERE bucket < %s "
+                            "ORDER BY embedding <=> %s::vector LIMIT %s",
+                            (sel, qstr(q), K))
+                        ids = {r[0] for r in cur.fetchall()}
+                        lats.append((time.perf_counter() - t0) * 1000.0)
+                        recalls.append(len(ids & truth) / K)
+                rec = float(np.mean(recalls))
+                med = float(np.median(lats))
+                p90 = float(np.percentile(lats, 90))
+                results.append((name, mf, sel, ef, rec, med, p90))
+                print(f"  {name:7s} mf={mf:3s} sel={sel:>2}%  ef={ef:>4}  "
+                      f"recall={rec:.3f}  med={med:.2f}ms  p90={p90:.2f}ms",
+                      flush=True)
 
 print("\n=== summary (recall / median ms / p90 ms) ===")
-hdr = "config   sel%  " + "  ".join(f"ef={e:<22}" for e in EFS)
+hdr = "config   mf   sel%  " + "  ".join(f"ef={e:<22}" for e in EFS)
 print(hdr)
 for name, _, _ in CONFIGS:
-    for sel in SELS:
-        cells = []
-        for ef in EFS:
-            row = next(r for r in results
-                       if r[0] == name and r[1] == sel and r[2] == ef)
-            cells.append(f"{row[3]:.3f}/{row[4]:6.2f}/{row[5]:7.2f}   ")
-        print(f"{name:8s} {sel:>3}   " + "".join(cells))
+    for mf in MF_MODES:
+        for sel in SELS:
+            cells = []
+            for ef in EFS:
+                row = next(r for r in results
+                           if r[0] == name and r[1] == mf
+                           and r[2] == sel and r[3] == ef)
+                cells.append(f"{row[4]:.3f}/{row[5]:6.2f}/{row[6]:7.2f}   ")
+            print(f"{name:8s} {mf:4s} {sel:>3}   " + "".join(cells))
 
 with conn.cursor() as cur:
     cur.execute("DROP TABLE IF EXISTS pe_items CASCADE")

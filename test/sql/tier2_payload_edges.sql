@@ -112,6 +112,25 @@ SELECT acorn_recall('items_on', 'bucket = 0', 'truth_eq', 100)
     >  acorn_recall('items_off', 'bucket = 0', 'truth_eq', 100) AS eq_gt_ef100;
 SELECT acorn_recall('items_on', 'bucket = 0', 'truth_eq', 100) >= 0.5 AS eq_recall_floor;
 
+-- member-first scan policy (pg_acorn.member_first): spend the ef_search
+-- budget on filter-passing candidates first.  Pairs with payload edges:
+-- once the traversal touches one partition member, the same-partition edges
+-- let the budget drain the predicate subgraph instead of the (mostly
+-- failing) global neighborhood.  Observed stable on this fixture:
+-- eq recall@ef40 = 0.6 with member_first vs 0.1 without.
+SHOW pg_acorn.member_first;
+SET pg_acorn.member_first = on;
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 100;
+SELECT bool_and(bucket = 0) AS mf_eq_filter_correct, count(*) = 10 AS mf_eq_full_k
+FROM (SELECT bucket FROM items_on WHERE bucket = 0
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+RESET enable_seqscan;
+SELECT acorn_recall('items_on', 'bucket = 0', 'truth_eq', 40) >= 0.5 AS mf_eq40_floor;
+SET pg_acorn.member_first = off;
+SELECT acorn_recall('items_on', 'bucket = 0', 'truth_eq', 40) <= 0.3 AS nomf_eq40_low;
+RESET pg_acorn.member_first;
+
 -- (d) insert path: aminsert with payload edges on stays correct.
 INSERT INTO items_on (bucket, embedding)
 SELECT (i % 50),

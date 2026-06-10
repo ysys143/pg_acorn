@@ -27,6 +27,17 @@ bool acorn_enable_2hop = false;
 /* GUC: runtime ef_search cap for acorn_hnsw (Tier 2) streaming scans */
 int acorn_ef_search = ACORN_DEFAULT_EF_SEARCH;
 
+/*
+ * GUC: member-first expansion for Tier 2 in-filter scans.  When on, the
+ * expansion budget (ef_search) is spent on filter-PASSING candidates first;
+ * failing candidates are only expanded when no passing candidate is queued.
+ * Designed to pair with indexes built with acorn_payload_edges=true, whose
+ * same-partition edges keep the predicate subgraph connected (Qdrant-style
+ * filtered traversal).  Emission ordering safety is unchanged: a result is
+ * only emitted when no unexpanded candidate of either kind is closer.
+ */
+bool acorn_member_first = false;
+
 void _PG_init(void);
 void _PG_fini(void);
 
@@ -81,6 +92,19 @@ _PG_init(void)
 		ACORN_DEFAULT_EF_SEARCH,	/* default */
 		1,							/* min */
 		4000,						/* max (expansion budget; allows deep sweeps) */
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.member_first */
+	DefineCustomBoolVariable(
+		"pg_acorn.member_first",
+		"Spend the Tier 2 ef_search budget on filter-passing candidates first "
+		"(pair with acorn_payload_edges=true indexes).",
+		NULL,
+		&acorn_member_first,
+		false,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL

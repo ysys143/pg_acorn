@@ -24,6 +24,7 @@
 #include "utils/rel.h"
 #include "access/tableam.h"
 
+#include "pg_acorn.h"
 #include "acorn_scan.h"
 #include "hnsw_compat.h"
 #include "acorn_t2_page.h"
@@ -829,11 +830,13 @@ struct AcornT2StreamScan
 	int				m;
 	int				ef_search;		/* expansion budget: max node expansions */
 	int				n_expansions;	/* expansions used so far */
-	pairingheap	   *C;			/* candidates to expand (min-heap) */
+	pairingheap	   *C;			/* failing candidates to expand (min-heap) */
+	pairingheap	   *Cm;			/* passing candidates (member_first mode) */
 	pairingheap	   *R;			/* discovered passing nodes, awaiting emit */
 	HTAB		   *visited;
 	MemoryContext	mcxt;
 	bool			exhausted;
+	bool			member_first;	/* spend budget on passing candidates first */
 	ScanKey			keys;		/* filter ScanKeys (lives in caller's memory) */
 	int				nkeys;
 };
@@ -1079,26 +1082,32 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 								 &nheaptid, &ndeleted, &nfilter_val,
 								 NULL, NULL);
 
-		/* Always add to C — ACORN invariant: preserve connectivity */
-		cn = palloc(sizeof(AcornPQNode));
-		ItemPointerCopy(&neighbors[i], &cn->elem.indextid);
-		ItemPointerSetInvalid(&cn->elem.heaptid);
-		cn->elem.distance = nd;
-		pairingheap_add(s->C, &cn->ph_node);
-
-		if (ndeleted)
-			continue;
-
-		if (acorn_t2_eval_filter(s->keys, s->nkeys, nfilter_val))
 		{
-			AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+			bool passes = !ndeleted &&
+				acorn_t2_eval_filter(s->keys, s->nkeys, nfilter_val);
 
-			ItemPointerCopy(&neighbors[i], &rn->elem.indextid);
-			ItemPointerCopy(&nheaptid, &rn->elem.heaptid);
-			rn->elem.distance = nd;
-			pairingheap_add(s->R, &rn->ph_node);
+			/*
+			 * Every neighbor stays expandable — ACORN invariant: preserve
+			 * connectivity.  In member_first mode passing candidates go to
+			 * Cm so the expansion budget prefers the predicate subgraph.
+			 */
+			cn = palloc(sizeof(AcornPQNode));
+			ItemPointerCopy(&neighbors[i], &cn->elem.indextid);
+			ItemPointerSetInvalid(&cn->elem.heaptid);
+			cn->elem.distance = nd;
+			pairingheap_add((s->member_first && passes) ? s->Cm : s->C,
+							&cn->ph_node);
+
+			if (passes)
+			{
+				AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+
+				ItemPointerCopy(&neighbors[i], &rn->elem.indextid);
+				ItemPointerCopy(&nheaptid, &rn->elem.heaptid);
+				rn->elem.distance = nd;
+				pairingheap_add(s->R, &rn->ph_node);
+			}
 		}
-
 	}
 
 }
@@ -1126,6 +1135,7 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	s->ef_search    = ef_search;
 	s->n_expansions = 0;
 	s->exhausted    = false;
+	s->member_first = acorn_member_first;
 	acorn_load_dist_proc(index, &s->dist_proc);
 
 	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m))
@@ -1140,8 +1150,9 @@ acorn_t2_stream_begin(Relation index, Datum query,
 		acorn_t2_greedy_descent(index, m, &entry_blkno, &entry_offno,
 								 entry_level, 0, query, &s->dist_proc);
 
-	s->C = pairingheap_allocate(pq_cmp_min, NULL);	/* candidates, nearest-first */
-	s->R = pairingheap_allocate(pq_cmp_min, NULL);	/* results, nearest-first */
+	s->C  = pairingheap_allocate(pq_cmp_min, NULL);	/* candidates, nearest-first */
+	s->Cm = pairingheap_allocate(pq_cmp_min, NULL);	/* passing candidates */
+	s->R  = pairingheap_allocate(pq_cmp_min, NULL);	/* results, nearest-first */
 
 	memset(&info, 0, sizeof(info));
 	info.keysize   = sizeof(ItemPointerData);
@@ -1165,20 +1176,26 @@ acorn_t2_stream_begin(Relation index, Datum query,
 		d = acorn_t2_load_node(s, entry_blkno, entry_offno,
 							   &heaptid, &deleted, &fval, NULL, NULL);
 
-		cn = palloc(sizeof(AcornPQNode));
-		ItemPointerCopy(&entry_tid, &cn->elem.indextid);
-		ItemPointerSetInvalid(&cn->elem.heaptid);
-		cn->elem.distance = d;
-		pairingheap_add(s->C, &cn->ph_node);
-
-		if (!deleted && acorn_t2_eval_filter(keys, nkeys, fval))
 		{
-			AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+			bool passes = !deleted &&
+				acorn_t2_eval_filter(keys, nkeys, fval);
 
-			ItemPointerCopy(&entry_tid, &rn->elem.indextid);
-			ItemPointerCopy(&heaptid, &rn->elem.heaptid);
-			rn->elem.distance = d;
-			pairingheap_add(s->R, &rn->ph_node);
+			cn = palloc(sizeof(AcornPQNode));
+			ItemPointerCopy(&entry_tid, &cn->elem.indextid);
+			ItemPointerSetInvalid(&cn->elem.heaptid);
+			cn->elem.distance = d;
+			pairingheap_add((s->member_first && passes) ? s->Cm : s->C,
+							&cn->ph_node);
+
+			if (passes)
+			{
+				AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+
+				ItemPointerCopy(&entry_tid, &rn->elem.indextid);
+				ItemPointerCopy(&heaptid, &rn->elem.heaptid);
+				rn->elem.distance = d;
+				pairingheap_add(s->R, &rn->ph_node);
+			}
 		}
 	}
 
@@ -1217,16 +1234,40 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 	{
 		double r_dist = pairingheap_is_empty(s->R) ? DBL_MAX
 			: ((AcornPQNode *) pairingheap_first(s->R))->elem.distance;
-		double c_dist = pairingheap_is_empty(s->C) ? DBL_MAX
+		double cf_dist = pairingheap_is_empty(s->C) ? DBL_MAX
 			: ((AcornPQNode *) pairingheap_first(s->C))->elem.distance;
+		double cm_dist = pairingheap_is_empty(s->Cm) ? DBL_MAX
+			: ((AcornPQNode *) pairingheap_first(s->Cm))->elem.distance;
+		double c_dist = Min(cf_dist, cm_dist);
 
-		/* Explore while a candidate may still beat the nearest result, but only
-		 * within the ef_search expansion budget. */
-		if (!pairingheap_is_empty(s->C) && c_dist <= r_dist
+		/*
+		 * Explore while a candidate may still beat the nearest result, but
+		 * only within the ef_search expansion budget.
+		 *
+		 * Expansion choice: in member_first mode, spend the budget on the
+		 * nearest PASSING candidate whenever one is queued — the payload
+		 * subgraph keeps same-partition nodes connected, so this drains the
+		 * predicate subgraph instead of the (mostly failing) global
+		 * neighborhood.  Emission safety is unaffected: c_dist still covers
+		 * both heaps, so a result is never emitted past a closer unexpanded
+		 * candidate of either kind.
+		 */
+		if (c_dist != DBL_MAX && c_dist <= r_dist
 			&& s->n_expansions < s->ef_search)
 		{
-			AcornPQNode *cn = (AcornPQNode *) pairingheap_remove_first(s->C);
-			AcornElem	 ce = cn->elem;
+			pairingheap *src;
+			AcornPQNode *cn;
+			AcornElem	 ce;
+
+			if (s->member_first && !pairingheap_is_empty(s->Cm))
+				src = s->Cm;
+			else if (!pairingheap_is_empty(s->C) && cf_dist <= cm_dist)
+				src = s->C;
+			else
+				src = s->Cm;
+
+			cn = (AcornPQNode *) pairingheap_remove_first(src);
+			ce = cn->elem;
 			pfree(cn);
 			acorn_t2_stream_expand(s, &ce);
 			s->n_expansions++;
