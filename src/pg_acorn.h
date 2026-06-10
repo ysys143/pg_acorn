@@ -12,6 +12,10 @@ extern bool acorn_enable_2hop;
 extern int  acorn_ef_search;
 extern bool acorn_member_first;
 
+/* Build-path toggles */
+extern bool acorn_build_direct_dist;
+extern int  acorn_build_seed;
+
 /* Tier 2 scan fast-path toggles (debug/benchmark) */
 extern bool acorn_scan_direct_dist;
 extern bool acorn_scan_prefetch;

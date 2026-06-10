@@ -42,6 +42,8 @@
 
 #include "pg_acorn.h"
 #include "acorn_am.h"
+#include "acorn_dist.h"
+#include "acorn_scan.h"
 #include "acorn_t2_page.h"
 
 /*
@@ -83,6 +85,13 @@ acorn_opt_payload_edges(Relation index)
 	return opts ? opts->payloadEdges : false;
 }
 
+static bool
+acorn_opt_diversify(Relation index)
+{
+	AcornOptions *opts = (AcornOptions *) index->rd_options;
+	return opts ? opts->diversify : true;
+}
+
 /* -----------------------------------------------------------------------
  * Payload partitions (acorn_payload_edges)
  *
@@ -117,18 +126,41 @@ acorn_m_eff(Relation index)
 
 /* -----------------------------------------------------------------------
  * Distance kernel (opclass support function 1)
+ *
+ * Resolved ONCE per build/insert: a direct C kernel (acorn_dist.c, fmgr
+ * bypass) for known pgvector distance functions, with the fmgr FunctionCall2
+ * path as fallback for unknown opclasses or dimension mismatch.  Mirrors the
+ * scan path's acorn_resolve_direct_dist usage — the bulk in-memory build is
+ * distance-dominated, so bypassing fmgr here is the build-time speedup lever.
  * ----------------------------------------------------------------------- */
 
-static FmgrInfo *
-acorn_dist_proc(Relation index)
+typedef struct AcornDistCtx
 {
-	return index_getprocinfo(index, 1, 1);
+	FmgrInfo	*proc;		/* fmgr fallback (always valid) */
+	AcornDistFn	 direct;	/* direct C kernel; NULL = always use proc */
+} AcornDistCtx;
+
+static void
+acorn_dist_ctx_init(Relation index, AcornDistCtx *dist)
+{
+	dist->proc   = index_getprocinfo(index, 1, 1);
+	dist->direct = acorn_build_direct_dist
+		? acorn_resolve_direct_dist(index) : NULL;
 }
 
 static inline double
-acorn_dist(FmgrInfo *proc, Datum stored_vec, Datum query)
+acorn_dist(const AcornDistCtx *dist, Datum stored_vec, Datum query)
 {
-	return DatumGetFloat8(FunctionCall2Coll(proc, InvalidOid, stored_vec, query));
+	if (dist->direct)
+	{
+		AcornPgVector *v = (AcornPgVector *) DatumGetPointer(stored_vec);
+		AcornPgVector *q = (AcornPgVector *) DatumGetPointer(query);
+
+		if (likely(v->dim == q->dim))
+			return dist->direct((int) v->dim, v->x, q->x);
+	}
+	return DatumGetFloat8(FunctionCall2Coll(dist->proc, InvalidOid,
+											stored_vec, query));
 }
 
 /* -----------------------------------------------------------------------
@@ -408,22 +440,22 @@ acorn_read_element(Relation index, ForkNumber forkNum, ItemPointer tid,
 static double
 acorn_node_distance(Relation index, ForkNumber forkNum,
 					BlockNumber blkno, OffsetNumber offno,
-					Datum query, FmgrInfo *proc, int64 *filter_out)
+					Datum query, const AcornDistCtx *dist, int64 *filter_out)
 {
 	Buffer				buf;
 	Page				page;
 	AcornT2ElementTuple etup;
-	double				dist;
+	double				d;
 
 	buf  = ReadBufferExtended(index, forkNum, blkno, RBM_NORMAL, NULL);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	etup = (AcornT2ElementTuple) PageGetItem(page, PageGetItemId(page, offno));
-	dist = acorn_dist(proc, PointerGetDatum(AcornT2ElementTupleGetVector(etup)), query);
+	d    = acorn_dist(dist, PointerGetDatum(AcornT2ElementTupleGetVector(etup)), query);
 	if (filter_out)
 		*filter_out = etup->filter_val;
 	UnlockReleaseBuffer(buf);
-	return dist;
+	return d;
 }
 
 /*
@@ -641,7 +673,7 @@ acorn_mem_push_node(AcornMemBuild *mb, Datum vec, Size vsize,
 
 /* In-memory greedy descent from from_level down to to_level+1 */
 static void
-acorn_mem_greedy_descend(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
+acorn_mem_greedy_descend(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 						  int *ep_id, Datum query,
 						  int from_level, int to_level)
 {
@@ -652,7 +684,7 @@ acorn_mem_greedy_descend(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
 		do {
 			int           cur      = *ep_id;
 			AcornMemNode *node     = &mb->nodes[cur];
-			double        cur_dist = acorn_dist(proc, node->vec, query);
+			double        cur_dist = acorn_dist(dist, node->vec, query);
 			int           start    = HnswNeighborStart(m_eff, node->level, lc);
 			int           layer_m  = HnswGetLayerM(m_eff, lc);
 
@@ -664,7 +696,7 @@ acorn_mem_greedy_descend(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
 
 				if (nbr_id < 0)
 					continue;	/* payload split may leave gaps between halves */
-				nd = acorn_dist(proc, mb->nodes[nbr_id].vec, query);
+				nd = acorn_dist(dist, mb->nodes[nbr_id].vec, query);
 				if (nd < cur_dist)
 				{
 					cur_dist = nd;
@@ -681,7 +713,7 @@ acorn_mem_greedy_descend(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
  * Returns up to ef results in out_ids[]/out_dists[], nearest-first.
  */
 static int
-acorn_mem_search_layer(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
+acorn_mem_search_layer(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 					   int entry_id, Datum query, int layer, int ef,
 					   int *out_ids, double *out_dists)
 {
@@ -700,7 +732,7 @@ acorn_mem_search_layer(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
 
 	/* Seed with entry_id */
 	{
-		double    ep_dist = acorn_dist(proc, mb->nodes[entry_id].vec, query);
+		double    ep_dist = acorn_dist(dist, mb->nodes[entry_id].vec, query);
 		MemPQNode *cn, *wn;
 
 		mb->visit_gen[entry_id] = mb->cur_gen;
@@ -743,7 +775,7 @@ acorn_mem_search_layer(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
 				continue;
 			mb->visit_gen[nbr_id] = mb->cur_gen;
 
-			nd     = acorn_dist(proc, mb->nodes[nbr_id].vec, query);
+			nd     = acorn_dist(dist, mb->nodes[nbr_id].vec, query);
 			f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
 
 			if (nd < f_dist || W_count < ef)
@@ -793,7 +825,7 @@ acorn_mem_search_layer(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
  * Returns up to ef same-partition node ids nearest-first.
  */
 static int
-acorn_mem_search_partition(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
+acorn_mem_search_partition(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 						   int entry_id, Datum query, int part, int ef,
 						   int *out_ids, double *out_dists)
 {
@@ -811,7 +843,7 @@ acorn_mem_search_partition(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
 	W = pairingheap_allocate(mem_cmp_max, NULL);
 
 	{
-		double     ep_dist = acorn_dist(proc, mb->nodes[entry_id].vec, query);
+		double     ep_dist = acorn_dist(dist, mb->nodes[entry_id].vec, query);
 		MemPQNode *cn, *wn;
 
 		Assert(acorn_payload_partition(mb->nodes[entry_id].filter_val) == part);
@@ -853,7 +885,7 @@ acorn_mem_search_partition(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
 			if (acorn_payload_partition(mb->nodes[nbr_id].filter_val) != part)
 				continue;	/* restricted to the partition subgraph */
 
-			nd     = acorn_dist(proc, mb->nodes[nbr_id].vec, query);
+			nd     = acorn_dist(dist, mb->nodes[nbr_id].vec, query);
 			f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
 
 			if (nd < f_dist || W_count < ef)
@@ -889,6 +921,67 @@ acorn_mem_search_partition(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
 }
 
 /*
+ * HNSW neighbor-selection diversity heuristic (Malkov Alg. 4 / pgvector
+ * HnswSelectNeighbors, with keepPrunedConnections).
+ *
+ * cand_ids/cand_dists hold candidates sorted ASCENDING by distance to the
+ * base vector.  A candidate is kept only if it is closer to the base than to
+ * every already-kept neighbor (dist(c, kept) > dist(c, base)); pruned
+ * candidates then refill remaining slots in ascending order so slots stay
+ * full.  Returns the number kept (<= m_max), written to kept_out as node ids.
+ *
+ * Without this, nearest-only selection on clustered data wires each node
+ * exclusively into its own cluster: layer 0 fragments into per-cluster
+ * components and whole buckets become unreachable (W1 root cause).
+ */
+static int
+acorn_mem_select_diverse(AcornMemBuild *mb, const AcornDistCtx *dist,
+						 const int *cand_ids, const double *cand_dists,
+						 int n_cands, int m_max, int *kept_out)
+{
+	int  n_kept   = 0;
+	int  n_pruned = 0;
+	int *pruned;
+
+	if (n_cands <= m_max)
+	{
+		/* keepPrunedConnections refills everything anyway — keep all */
+		memcpy(kept_out, cand_ids, n_cands * sizeof(int));
+		return n_cands;
+	}
+
+	pruned = palloc(n_cands * sizeof(int));
+
+	for (int i = 0; i < n_cands && n_kept < m_max; i++)
+	{
+		bool keep = true;
+
+		for (int j = 0; j < n_kept; j++)
+		{
+			double d = acorn_dist(dist, mb->nodes[cand_ids[i]].vec,
+								  mb->nodes[kept_out[j]].vec);
+
+			if (d <= cand_dists[i])
+			{
+				keep = false;
+				break;
+			}
+		}
+		if (keep)
+			kept_out[n_kept++] = cand_ids[i];
+		else
+			pruned[n_pruned++] = cand_ids[i];
+	}
+
+	/* keepPrunedConnections: refill remaining slots from pruned, in order */
+	for (int p = 0; p < n_pruned && n_kept < m_max; p++)
+		kept_out[n_kept++] = pruned[p];
+
+	pfree(pruned);
+	return n_kept;
+}
+
+/*
  * Bidirectional edge with FIXED-SLOT RETRY restricted to a slot range
  * [slot_base, slot_base + slot_count) of nbr_id's flat slot array.
  * With payload edges off the range covers a whole layer; with payload edges
@@ -897,13 +990,16 @@ acorn_mem_search_partition(AcornMemBuild *mb, FmgrInfo *proc, int m_eff,
  *
  * If part >= 0 (payload half), slots occupied by nodes OUTSIDE the partition
  * (graceful-degradation backfill) are evicted preferentially: a same-
- * partition edge is strictly more valuable there.  Otherwise the standard
- * replace-furthest-if-closer retry applies.
+ * partition edge is strictly more valuable there.  Otherwise, with diversify
+ * on, the eviction choice is made by the diversity heuristic over
+ * existing + new (pgvector HnswUpdateConnection semantics); with diversify
+ * off the legacy replace-furthest-if-closer retry applies.
  */
 static void
-acorn_mem_add_reverse_edge(AcornMemBuild *mb, FmgrInfo *proc,
+acorn_mem_add_reverse_edge(AcornMemBuild *mb, const AcornDistCtx *dist,
 						   int nbr_id, int new_id,
-						   int slot_base, int slot_count, int part)
+						   int slot_base, int slot_count, int part,
+						   bool diversify)
 {
 	AcornMemNode *nbr_node = &mb->nodes[nbr_id];
 	AcornMemNode *node     = &mb->nodes[new_id];
@@ -926,7 +1022,7 @@ acorn_mem_add_reverse_edge(AcornMemBuild *mb, FmgrInfo *proc,
 		if (part >= 0 &&
 			acorn_payload_partition(mb->nodes[eid].filter_val) != part)
 		{
-			double d = acorn_dist(proc, nbr_node->vec, mb->nodes[eid].vec);
+			double d = acorn_dist(dist, nbr_node->vec, mb->nodes[eid].vec);
 
 			if (d > nonmember_d)
 			{
@@ -948,16 +1044,96 @@ acorn_mem_add_reverse_edge(AcornMemBuild *mb, FmgrInfo *proc,
 		return;
 	}
 
+	if (diversify)
+	{
+		/*
+		 * Full: re-select with the diversity heuristic over existing + new.
+		 * n_cands = slot_count + 1 while keepPrunedConnections refills to
+		 * slot_count, so exactly one candidate is dropped: if it is the new
+		 * node nothing changes, otherwise the new node takes its slot.
+		 */
+		int		n_cands = slot_count + 1;
+		int	   *ids     = palloc(n_cands * sizeof(int));
+		double *dists   = palloc(n_cands * sizeof(double));
+		int	   *kept    = palloc(slot_count * sizeof(int));
+		int		n_kept;
+		bool	new_kept = false;
+
+		for (int j = 0; j < slot_count; j++)
+		{
+			ids[j]   = nbr_node->nbr[slot_base + j];
+			dists[j] = acorn_dist(dist, nbr_node->vec, mb->nodes[ids[j]].vec);
+		}
+		ids[slot_count]   = new_id;
+		dists[slot_count] = acorn_dist(dist, nbr_node->vec, node->vec);
+
+		/* insertion sort ascending by distance (slot_count <= 2*m_eff) */
+		for (int i = 1; i < n_cands; i++)
+		{
+			int    tmp_id = ids[i];
+			double tmp_d  = dists[i];
+			int    k      = i - 1;
+
+			while (k >= 0 && dists[k] > tmp_d)
+			{
+				ids[k + 1]   = ids[k];
+				dists[k + 1] = dists[k];
+				k--;
+			}
+			ids[k + 1]   = tmp_id;
+			dists[k + 1] = tmp_d;
+		}
+
+		n_kept = acorn_mem_select_diverse(mb, dist, ids, dists, n_cands,
+										  slot_count, kept);
+
+		for (int i = 0; i < n_kept; i++)
+		{
+			if (kept[i] == new_id)
+			{
+				new_kept = true;
+				break;
+			}
+		}
+		if (new_kept)
+		{
+			/* replace the single existing occupant that was dropped */
+			for (int j = 0; j < slot_count; j++)
+			{
+				int  eid     = nbr_node->nbr[slot_base + j];
+				bool in_kept = false;
+
+				for (int i = 0; i < n_kept; i++)
+				{
+					if (kept[i] == eid)
+					{
+						in_kept = true;
+						break;
+					}
+				}
+				if (!in_kept)
+				{
+					nbr_node->nbr[slot_base + j] = new_id;
+					break;
+				}
+			}
+		}
+		pfree(ids);
+		pfree(dists);
+		pfree(kept);
+		return;
+	}
+
 	/* Full: replace the furthest existing neighbor if the new node is closer */
 	{
-		double d_new      = acorn_dist(proc, nbr_node->vec, node->vec);
+		double d_new      = acorn_dist(dist, nbr_node->vec, node->vec);
 		double furthest_d = -DBL_MAX;
 		int    furthest_j = -1;
 
 		for (int j = 0; j < slot_count; j++)
 		{
 			int    eid = nbr_node->nbr[slot_base + j];
-			double d   = acorn_dist(proc, nbr_node->vec, mb->nodes[eid].vec);
+			double d   = acorn_dist(dist, nbr_node->vec, mb->nodes[eid].vec);
 
 			if (d > furthest_d)
 			{
@@ -976,7 +1152,8 @@ acorn_mem_add_reverse_edge(AcornMemBuild *mb, FmgrInfo *proc,
  * fills neighbor IDs, and writes reverse edges with fixed-slot retry.
  */
 static void
-acorn_mem_insert_node(AcornMemBuild *mb, FmgrInfo *proc, int m_eff, int efc,
+acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
+					  int m_eff, int efc, bool diversify,
 					  unsigned short rand_state[3], int new_id)
 {
 	AcornMemNode *node    = &mb->nodes[new_id];
@@ -1005,7 +1182,7 @@ acorn_mem_insert_node(AcornMemBuild *mb, FmgrInfo *proc, int m_eff, int efc,
 	ep_id = mb->entry_id;
 
 	if (mb->entry_level > level)
-		acorn_mem_greedy_descend(mb, proc, m_eff, &ep_id,
+		acorn_mem_greedy_descend(mb, dist, m_eff, &ep_id,
 								  node->vec, mb->entry_level, level);
 
 	out_ids   = palloc(sizeof(int)    * efc);
@@ -1015,7 +1192,7 @@ acorn_mem_insert_node(AcornMemBuild *mb, FmgrInfo *proc, int m_eff, int efc,
 	{
 		int layer_m = HnswGetLayerM(m_eff, lc);
 		int start   = HnswNeighborStart(m_eff, level, lc);
-		int n_cands = acorn_mem_search_layer(mb, proc, m_eff,
+		int n_cands = acorn_mem_search_layer(mb, dist, m_eff,
 											  ep_id, node->vec, lc, efc,
 											  out_ids, out_dists);
 
@@ -1028,28 +1205,43 @@ acorn_mem_insert_node(AcornMemBuild *mb, FmgrInfo *proc, int m_eff, int efc,
 			int  g_half   = layer_m / 2;	/* = m_eff */
 			int  p_half   = layer_m - g_half;
 			int  part     = acorn_payload_partition(node->filter_val);
-			int  n_global = Min(n_cands, g_half);
+			int  n_global;
 			int  p_filled = 0;
+			int *g_sel    = palloc(sizeof(int) * g_half);
 
+			/* Global half: diversity-select up to g_half from the beam */
+			if (diversify)
+				n_global = acorn_mem_select_diverse(mb, dist,
+													out_ids, out_dists,
+													n_cands, g_half, g_sel);
+			else
+			{
+				n_global = Min(n_cands, g_half);
+				memcpy(g_sel, out_ids, n_global * sizeof(int));
+			}
 			for (int i = 0; i < n_global; i++)
-				node->nbr[start + i] = out_ids[i];
+				node->nbr[start + i] = g_sel[i];
 
 			if (mb->part_entry[part] >= 0)
 			{
 				int    *p_ids   = palloc(sizeof(int) * efc);
 				double *p_dists = palloc(sizeof(double) * efc);
-				int     n_part  = acorn_mem_search_partition(mb, proc, m_eff,
+				int     n_part  = acorn_mem_search_partition(mb, dist, m_eff,
 															 mb->part_entry[part],
 															 node->vec, part, efc,
 															 p_ids, p_dists);
+				int     n_avail = 0;
+				int    *p_sel   = palloc(sizeof(int) * p_half);
+				int     n_sel;
 
-				for (int i = 0; i < n_part && p_filled < p_half; i++)
+				/* drop candidates already wired as global neighbors */
+				for (int i = 0; i < n_part; i++)
 				{
 					bool dup = false;
 
 					for (int j = 0; j < n_global; j++)
 					{
-						if (node->nbr[start + j] == p_ids[i])
+						if (g_sel[j] == p_ids[i])
 						{
 							dup = true;
 							break;
@@ -1057,37 +1249,59 @@ acorn_mem_insert_node(AcornMemBuild *mb, FmgrInfo *proc, int m_eff, int efc,
 					}
 					if (dup)
 						continue;	/* already a global neighbor of this node */
+					p_ids[n_avail]   = p_ids[i];
+					p_dists[n_avail] = p_dists[i];
+					n_avail++;
+				}
 
-					node->nbr[start + g_half + p_filled] = p_ids[i];
+				/* Payload half: diversity within the partition too */
+				if (diversify)
+					n_sel = acorn_mem_select_diverse(mb, dist, p_ids, p_dists,
+													 n_avail, p_half, p_sel);
+				else
+				{
+					n_sel = Min(n_avail, p_half);
+					memcpy(p_sel, p_ids, n_sel * sizeof(int));
+				}
+
+				for (int i = 0; i < n_sel; i++)
+				{
+					node->nbr[start + g_half + p_filled] = p_sel[i];
 					p_filled++;
 
 					/* bidirectional: reverse edge into the member's payload half */
-					acorn_mem_add_reverse_edge(mb, proc, p_ids[i], new_id,
-						HnswNeighborStart(m_eff, mb->nodes[p_ids[i]].level, 0) + g_half,
-						p_half, part);
+					acorn_mem_add_reverse_edge(mb, dist, p_sel[i], new_id,
+						HnswNeighborStart(m_eff, mb->nodes[p_sel[i]].level, 0) + g_half,
+						p_half, part, diversify);
 				}
+				pfree(p_sel);
 				pfree(p_ids);
 				pfree(p_dists);
 			}
 
 			/*
 			 * Graceful degradation: if the partition is still too small, fill
-			 * remaining payload slots with the next-best global candidates
-			 * (forward edges only — they are not partition members).
+			 * remaining payload slots with the next-best UNUSED global
+			 * candidates (forward edges only — they are not partition members).
 			 */
-			for (int i = g_half; i < n_cands && p_filled < p_half; i++)
+			for (int i = 0; i < n_cands && p_filled < p_half; i++)
 			{
-				bool dup = false;
+				bool used = false;
 
-				for (int j = 0; j < p_filled; j++)
+				for (int j = 0; j < n_global; j++)
 				{
-					if (node->nbr[start + g_half + j] == out_ids[i])
+					if (g_sel[j] == out_ids[i])
 					{
-						dup = true;
+						used = true;
 						break;
 					}
 				}
-				if (dup)
+				for (int j = 0; !used && j < p_filled; j++)
+				{
+					if (node->nbr[start + g_half + j] == out_ids[i])
+						used = true;
+				}
+				if (used)
 					continue;
 				node->nbr[start + g_half + p_filled] = out_ids[i];
 				p_filled++;
@@ -1095,20 +1309,34 @@ acorn_mem_insert_node(AcornMemBuild *mb, FmgrInfo *proc, int m_eff, int efc,
 
 			/* Reverse edges for the global half into neighbors' global halves */
 			for (int i = 0; i < n_global; i++)
-				acorn_mem_add_reverse_edge(mb, proc, out_ids[i], new_id,
-					HnswNeighborStart(m_eff, mb->nodes[out_ids[i]].level, 0),
-					g_half, -1);
+				acorn_mem_add_reverse_edge(mb, dist, g_sel[i], new_id,
+					HnswNeighborStart(m_eff, mb->nodes[g_sel[i]].level, 0),
+					g_half, -1, diversify);
+			pfree(g_sel);
 		}
 		else
 		{
-			for (int i = 0; i < Min(n_cands, layer_m); i++)
-				node->nbr[start + i] = out_ids[i];
+			int  n_sel;
+			int *sel = palloc(sizeof(int) * layer_m);
+
+			if (diversify)
+				n_sel = acorn_mem_select_diverse(mb, dist, out_ids, out_dists,
+												 n_cands, layer_m, sel);
+			else
+			{
+				n_sel = Min(n_cands, layer_m);
+				memcpy(sel, out_ids, n_sel * sizeof(int));
+			}
+
+			for (int i = 0; i < n_sel; i++)
+				node->nbr[start + i] = sel[i];
 
 			/* Reverse edges with fixed-slot retry over the whole layer range */
-			for (int i = 0; i < Min(n_cands, layer_m); i++)
-				acorn_mem_add_reverse_edge(mb, proc, out_ids[i], new_id,
-					HnswNeighborStart(m_eff, mb->nodes[out_ids[i]].level, lc),
-					layer_m, -1);
+			for (int i = 0; i < n_sel; i++)
+				acorn_mem_add_reverse_edge(mb, dist, sel[i], new_id,
+					HnswNeighborStart(m_eff, mb->nodes[sel[i]].level, lc),
+					layer_m, -1, diversify);
+			pfree(sel);
 		}
 
 		if (n_cands > 0)
@@ -1134,14 +1362,17 @@ static void
 acorn_mem_build_graph(AcornMemBuild *mb, Relation index,
 					  unsigned short rand_state[3])
 {
-	int      m_eff = acorn_m_eff(index);
-	int      efc   = acorn_opt_ef_construction(index);
-	FmgrInfo *proc = acorn_dist_proc(index);
+	int          m_eff = acorn_m_eff(index);
+	int          efc   = acorn_opt_ef_construction(index);
+	bool         diversify = acorn_opt_diversify(index);
+	AcornDistCtx dist;
+
+	acorn_dist_ctx_init(index, &dist);
 
 	for (int i = 0; i < mb->n_nodes; i++)
 	{
 		CHECK_FOR_INTERRUPTS();
-		acorn_mem_insert_node(mb, proc, m_eff, efc, rand_state, i);
+		acorn_mem_insert_node(mb, &dist, m_eff, efc, diversify, rand_state, i);
 	}
 }
 
@@ -1353,7 +1584,7 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 static void
 acorn_greedy_descend_build(Relation index, ForkNumber forkNum,
 						   BlockNumber *cur_blkno, OffsetNumber *cur_offno,
-						   Datum query, FmgrInfo *proc, int m_eff,
+						   Datum query, const AcornDistCtx *dist, int m_eff,
 						   int from_level, int to_level)
 {
 	for (int lc = from_level; lc > to_level; lc--)
@@ -1372,7 +1603,7 @@ acorn_greedy_descend_build(Relation index, ForkNumber forkNum,
 			improved = false;
 			cur_dist = acorn_node_distance(index, forkNum,
 										   *cur_blkno, *cur_offno,
-										   query, proc, NULL);
+										   query, dist, NULL);
 			ItemPointerSet(&c_tid, *cur_blkno, *cur_offno);
 			acorn_read_element(index, forkNum, &c_tid, &c_level,
 							   &c_nbr_blk, &c_nbr_off, NULL, NULL);
@@ -1387,7 +1618,7 @@ acorn_greedy_descend_build(Relation index, ForkNumber forkNum,
 				double nd = acorn_node_distance(index, forkNum,
 												 ItemPointerGetBlockNumber(&nbrs[i]),
 												 ItemPointerGetOffsetNumber(&nbrs[i]),
-												 query, proc, NULL);
+												 query, dist, NULL);
 				if (nd < cur_dist)
 				{
 					cur_dist   = nd;
@@ -1430,7 +1661,7 @@ typedef struct AcornCand
 static int
 acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 								  BlockNumber entry_blkno, OffsetNumber entry_offno,
-								  Datum query, FmgrInfo *proc, int m_eff,
+								  Datum query, const AcornDistCtx *dist, int m_eff,
 								  int layer, int ef,
 								  AcornCand *out_cands,
 								  int part, int max_expansions)
@@ -1463,7 +1694,7 @@ acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 		build_mark_visited(visited, &ep_tid);
 		ep_dist = acorn_node_distance(index, forkNum,
 									   entry_blkno, entry_offno,
-									   query, proc, &ep_fval);
+									   query, dist, &ep_fval);
 
 		cn           = palloc(sizeof(BuildPQNode));
 		cn->tid      = ep_tid;
@@ -1533,7 +1764,7 @@ acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 			nd = acorn_node_distance(index, forkNum,
 									  ItemPointerGetBlockNumber(&nbrs[i]),
 									  ItemPointerGetOffsetNumber(&nbrs[i]),
-									  query, proc, &nfval);
+									  query, dist, &nfval);
 			is_member = (part < 0 || acorn_payload_partition(nfval) == part);
 
 			f_dist = pairingheap_is_empty(W) ? DBL_MAX
@@ -1591,6 +1822,79 @@ acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 	return n_out;
 }
 
+/*
+ * Diversity selection over disk candidates (AcornCand tid/distance pairs
+ * sorted ascending by distance to the base).  Mirrors acorn_mem_select_diverse
+ * (Malkov Alg. 4 + keepPrunedConnections); reads each candidate's inline
+ * vector once for the pairwise checks.  Writes up to m_max kept candidates to
+ * kept_out and returns the count.
+ */
+static int
+acorn_select_diverse_tids(Relation index, ForkNumber forkNum,
+						  const AcornDistCtx *dist,
+						  const AcornCand *cands, int n_cands,
+						  int m_max, AcornCand *kept_out)
+{
+	Datum	   *vecs;
+	int		   *kept_idx;
+	int		   *pruned;
+	int			n_kept = 0;
+	int			n_pruned = 0;
+
+	if (n_cands <= m_max)
+	{
+		/* keepPrunedConnections refills everything anyway — keep all */
+		memcpy(kept_out, cands, n_cands * sizeof(AcornCand));
+		return n_cands;
+	}
+
+	vecs     = palloc(n_cands * sizeof(Datum));
+	kept_idx = palloc(m_max * sizeof(int));
+	pruned   = palloc(n_cands * sizeof(int));
+
+	for (int i = 0; i < n_cands; i++)
+	{
+		ItemPointerData tid = cands[i].tid;
+
+		acorn_read_element(index, forkNum, &tid, NULL, NULL, NULL,
+						   &vecs[i], NULL);
+	}
+
+	for (int i = 0; i < n_cands && n_kept < m_max; i++)
+	{
+		bool keep = true;
+
+		for (int j = 0; j < n_kept; j++)
+		{
+			double d = acorn_dist(dist, vecs[i], vecs[kept_idx[j]]);
+
+			if (d <= cands[i].distance)
+			{
+				keep = false;
+				break;
+			}
+		}
+		if (keep)
+			kept_idx[n_kept++] = i;
+		else
+			pruned[n_pruned++] = i;
+	}
+
+	/* keepPrunedConnections: refill remaining slots from pruned, in order */
+	for (int p = 0; p < n_pruned && n_kept < m_max; p++)
+		kept_idx[n_kept++] = pruned[p];
+
+	for (int i = 0; i < n_kept; i++)
+		kept_out[i] = cands[kept_idx[i]];
+
+	for (int i = 0; i < n_cands; i++)
+		pfree(DatumGetPointer(vecs[i]));
+	pfree(vecs);
+	pfree(kept_idx);
+	pfree(pruned);
+	return n_kept;
+}
+
 /* -----------------------------------------------------------------------
  * Fixed-slot retry reverse edge (generalized to any layer)
  * ----------------------------------------------------------------------- */
@@ -1610,9 +1914,10 @@ static void
 acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 								 ItemPointer n_tid,
 								 BlockNumber e_blk, OffsetNumber e_off,
-								 Datum e_value, FmgrInfo *proc,
+								 Datum e_value, const AcornDistCtx *dist,
 								 int m_eff, int layer,
-								 int range_off, int range_len, int part)
+								 int range_off, int range_len, int part,
+								 bool diversify)
 {
 	int				  n_level;
 	BlockNumber		  n_nbr_blk;
@@ -1677,7 +1982,7 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 
 			acorn_read_element(index, forkNum, &tids_copy[j],
 							   NULL, NULL, NULL, &vj, &fj);
-			d = acorn_dist(proc, n_vec, vj);
+			d = acorn_dist(dist, n_vec, vj);
 			pfree(DatumGetPointer(vj));
 			if (acorn_payload_partition(fj) != part && d > nonmember_d)
 			{
@@ -1689,12 +1994,119 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 			target = nonmember_j;
 	}
 
-	if (target < 0)
+	if (target < 0 && diversify)
+	{
+		/*
+		 * --- Phase 1b (diversify): heuristic re-selection over existing + E.
+		 * n_cands = range_len + 1 while keepPrunedConnections refills to
+		 * range_len, so exactly one candidate is dropped: if it is an
+		 * existing occupant E takes its slot, if it is E nothing changes.
+		 * Candidate index range_len denotes E itself.
+		 */
+		int		n_cands  = range_len + 1;
+		Datum  *vecs     = palloc(n_cands * sizeof(Datum));
+		double *dists    = palloc(n_cands * sizeof(double));
+		int	   *order    = palloc(n_cands * sizeof(int));
+		int	   *kept     = palloc(range_len * sizeof(int));
+		int	   *pruned   = palloc(n_cands * sizeof(int));
+		int		n_kept   = 0;
+		int		n_pruned = 0;
+		bool	e_kept   = false;
+
+		for (int j = 0; j < range_len; j++)
+		{
+			acorn_read_element(index, forkNum, &tids_copy[j],
+							   NULL, NULL, NULL, &vecs[j], NULL);
+			dists[j] = acorn_dist(dist, n_vec, vecs[j]);
+			order[j] = j;
+		}
+		vecs[range_len]  = e_value;		/* not palloc'd here — do not pfree */
+		dists[range_len] = acorn_dist(dist, n_vec, e_value);
+		order[range_len] = range_len;
+
+		/* insertion sort of order[] ascending by distance to N */
+		for (int i = 1; i < n_cands; i++)
+		{
+			int    oi = order[i];
+			double di = dists[oi];
+			int    k  = i - 1;
+
+			while (k >= 0 && dists[order[k]] > di)
+			{
+				order[k + 1] = order[k];
+				k--;
+			}
+			order[k + 1] = oi;
+		}
+
+		for (int i = 0; i < n_cands && n_kept < range_len; i++)
+		{
+			int  ci   = order[i];
+			bool keep = true;
+
+			for (int j = 0; j < n_kept; j++)
+			{
+				double d = acorn_dist(dist, vecs[ci], vecs[kept[j]]);
+
+				if (d <= dists[ci])
+				{
+					keep = false;
+					break;
+				}
+			}
+			if (keep)
+				kept[n_kept++] = ci;
+			else
+				pruned[n_pruned++] = ci;
+		}
+		for (int p = 0; p < n_pruned && n_kept < range_len; p++)
+			kept[n_kept++] = pruned[p];
+
+		for (int i = 0; i < n_kept; i++)
+		{
+			if (kept[i] == range_len)
+			{
+				e_kept = true;
+				break;
+			}
+		}
+		if (e_kept)
+		{
+			/* find the single dropped existing occupant's slot */
+			for (int j = 0; j < range_len; j++)
+			{
+				bool in_kept = false;
+
+				for (int i = 0; i < n_kept; i++)
+				{
+					if (kept[i] == j)
+					{
+						in_kept = true;
+						break;
+					}
+				}
+				if (!in_kept)
+				{
+					target = j;
+					break;
+				}
+			}
+		}
+
+		for (int j = 0; j < range_len; j++)
+			pfree(DatumGetPointer(vecs[j]));
+		pfree(vecs);
+		pfree(dists);
+		pfree(order);
+		pfree(kept);
+		pfree(pruned);
+	}
+	else if (target < 0)
 	{
 		/* --- Phase 1b: full — retry: find furthest, replace if E is closer --- */
 		double furthest_d = -DBL_MAX;
 		int    furthest_j = -1;
-		double dEN        = acorn_dist(proc, n_vec, e_value);
+		double dEN        = acorn_dist(dist, n_vec, e_value);
 
 		for (int j = 0; j < range_len; j++)
 		{
@@ -1703,7 +2115,7 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 
 			acorn_read_element(index, forkNum, &tids_copy[j],
 							   NULL, NULL, NULL, &vj, NULL);
-			d = acorn_dist(proc, n_vec, vj);
+			d = acorn_dist(dist, n_vec, vj);
 			pfree(DatumGetPointer(vj));
 			if (d > furthest_d)
 			{
@@ -1772,9 +2184,13 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 {
 	int					m_eff    = acorn_m_eff(index);
 	int					efc      = acorn_opt_ef_construction(index);
-	FmgrInfo		   *proc     = acorn_dist_proc(index);
+	bool				diversify = acorn_opt_diversify(index);
+	AcornDistCtx		dist_ctx;
+	const AcornDistCtx *dist     = &dist_ctx;
 	Size				vsize    = VARSIZE_ANY(DatumGetPointer(value));
 	Size				etupSize = ACORN_T2_ELEMENT_TUPLE_SIZE(vsize);
+
+	acorn_dist_ctx_init(index, &dist_ctx);
 
 	if (etupSize > HNSW_MAX_SIZE)
 		ereport(ERROR,
@@ -1833,7 +2249,7 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 		/* Greedy descent from entry_level down to l_new+1 (ef=1 per layer) */
 		if (entry_level > l_new)
 			acorn_greedy_descend_build(index, forkNum, &ep_blkno, &ep_offno,
-									   value, proc, m_eff,
+									   value, dist, m_eff,
 									   entry_level, l_new);
 
 		/* Beam search from min(entry_level, l_new) down to 0 */
@@ -1846,7 +2262,7 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 
 			n_cands = acorn_search_layer_construction(index, forkNum,
 													   ep_blkno, ep_offno,
-													   value, proc, m_eff,
+													   value, dist, m_eff,
 													   lc, efc, cands, -1, 0);
 
 			if (lc == 0 && payload_on)
@@ -1859,21 +2275,34 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 				 */
 				int			g_half   = layer_m / 2;		/* = m_eff */
 				int			p_half   = layer_m - g_half;
-				int			n_global = Min(n_cands, g_half);
+				int			n_global;
 				int			p_filled = 0;
 				AcornCand  *pcands   = palloc(sizeof(AcornCand) * efc);
+				AcornCand  *gsel     = palloc(sizeof(AcornCand) * g_half);
 				int			n_part;
+				int			n_avail  = 0;
 
+				/* Global half: diversity-select up to g_half from the beam */
+				if (diversify)
+					n_global = acorn_select_diverse_tids(index, forkNum, dist,
+														 cands, n_cands,
+														 g_half, gsel);
+				else
+				{
+					n_global = Min(n_cands, g_half);
+					memcpy(gsel, cands, n_global * sizeof(AcornCand));
+				}
 				for (int i = 0; i < n_global; i++)
-					ntids[start + i] = cands[i].tid;
+					ntids[start + i] = gsel[i].tid;
 
 				n_part = acorn_search_layer_construction(index, forkNum,
 														  ep_blkno, ep_offno,
-														  value, proc, m_eff,
+														  value, dist, m_eff,
 														  0, efc, pcands,
 														  part, efc * 8);
 
-				for (int i = 0; i < n_part && p_filled < p_half; i++)
+				/* drop candidates already wired as global neighbors */
+				for (int i = 0; i < n_part; i++)
 				{
 					bool dup = false;
 
@@ -1887,31 +2316,74 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 					}
 					if (dup)
 						continue;
-					ntids[start + g_half + p_filled] = pcands[i].tid;
-					p_filled++;
+					pcands[n_avail++] = pcands[i];
+				}
+
+				/* Payload half: diversity within the partition too */
+				if (diversify)
+				{
+					AcornCand  *psel  = palloc(sizeof(AcornCand) * p_half);
+					int			n_sel = acorn_select_diverse_tids(index, forkNum,
+																  dist, pcands,
+																  n_avail,
+																  p_half, psel);
+
+					for (int i = 0; i < n_sel; i++)
+					{
+						ntids[start + g_half + p_filled] = psel[i].tid;
+						p_filled++;
+					}
+					pfree(psel);
+				}
+				else
+				{
+					for (int i = 0; i < n_avail && p_filled < p_half; i++)
+					{
+						ntids[start + g_half + p_filled] = pcands[i].tid;
+						p_filled++;
+					}
 				}
 				n_payload_real = p_filled;
 
-				/* graceful degradation: backfill with next global candidates */
-				for (int i = g_half; i < n_cands && p_filled < p_half; i++)
+				/* graceful degradation: backfill with unused global candidates */
+				for (int i = 0; i < n_cands && p_filled < p_half; i++)
 				{
-					bool dup = false;
+					bool used = false;
 
-					for (int j = 0; j < p_filled; j++)
+					for (int j = 0; j < n_global; j++)
 					{
-						if (ItemPointerEquals(&ntids[start + g_half + j],
-											  &cands[i].tid))
+						if (ItemPointerEquals(&ntids[start + j], &cands[i].tid))
 						{
-							dup = true;
+							used = true;
 							break;
 						}
 					}
-					if (dup)
+					for (int j = 0; !used && j < p_filled; j++)
+					{
+						if (ItemPointerEquals(&ntids[start + g_half + j],
+											  &cands[i].tid))
+							used = true;
+					}
+					if (used)
 						continue;
 					ntids[start + g_half + p_filled] = cands[i].tid;
 					p_filled++;
 				}
+				pfree(gsel);
 				pfree(pcands);
+			}
+			else if (diversify)
+			{
+				/* Diversity-select up to layer_m of the beam candidates */
+				AcornCand  *sel   = palloc(sizeof(AcornCand) * layer_m);
+				int			n_sel = acorn_select_diverse_tids(index, forkNum,
+															  dist, cands,
+															  n_cands,
+															  layer_m, sel);
+
+				for (int i = 0; i < n_sel; i++)
+					ntids[start + i] = sel[i].tid;
+				pfree(sel);
 			}
 			else
 			{
@@ -1975,8 +2447,8 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 					acorn_add_reverse_edge_at_layer(index, forkNum,
 													 &ntids[start + i],
 													 e_blk, e_off,
-													 value, proc, m_eff, lc,
-													 0, g_half, -1);
+													 value, dist, m_eff, lc,
+													 0, g_half, -1, diversify);
 				}
 
 				/*
@@ -1991,8 +2463,9 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 					acorn_add_reverse_edge_at_layer(index, forkNum,
 													 &ntids[start + g_half + i],
 													 e_blk, e_off,
-													 value, proc, m_eff, lc,
-													 g_half, p_half, part);
+													 value, dist, m_eff, lc,
+													 g_half, p_half, part,
+													 diversify);
 				}
 			}
 			else
@@ -2004,8 +2477,8 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 					acorn_add_reverse_edge_at_layer(index, forkNum,
 													 &ntids[start + i],
 													 e_blk, e_off,
-													 value, proc, m_eff, lc,
-													 0, layer_m, -1);
+													 value, dist, m_eff, lc,
+													 0, layer_m, -1, diversify);
 				}
 			}
 		}
@@ -2095,10 +2568,20 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 		bs.forkNum    = forkNum;
 		bs.ntuples    = 0;
 		bs.has_filter = (RelationGetDescr(index)->natts > 1);
-		/* Seed from process ID; gives different level sequences per build */
-		bs.rand_state[0] = (unsigned short) (MyProcPid & 0xFFFF);
-		bs.rand_state[1] = (unsigned short) (MyProcPid >> 16);
-		bs.rand_state[2] = 0x1234;
+		if (acorn_build_seed >= 0)
+		{
+			/* Deterministic level RNG: same data + same seed -> same graph */
+			bs.rand_state[0] = (unsigned short) (acorn_build_seed & 0xFFFF);
+			bs.rand_state[1] = (unsigned short) ((acorn_build_seed >> 16) & 0xFFFF);
+			bs.rand_state[2] = 0x1234;
+		}
+		else
+		{
+			/* Legacy: seed from process ID; different level sequences per build */
+			bs.rand_state[0] = (unsigned short) (MyProcPid & 0xFFFF);
+			bs.rand_state[1] = (unsigned short) (MyProcPid >> 16);
+			bs.rand_state[2] = 0x1234;
+		}
 		bs.mb = acorn_mem_build_init(build_ctx);
 		/* payload edges need a filter column to partition on */
 		bs.mb->payload_edges = acorn_opt_payload_edges(index) && bs.has_filter;

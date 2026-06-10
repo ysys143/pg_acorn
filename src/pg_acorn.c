@@ -42,6 +42,23 @@ bool acorn_member_first = false;
 bool acorn_scan_direct_dist = true;
 
 /*
+ * GUC: build-path toggle — direct C distance kernel (fmgr bypass) for index
+ * build and incremental insert.  Every distance during construction otherwise
+ * goes through fmgr (133ns vs 28ns SIMD floor measured by W3); the in-memory
+ * bulk build is distance-dominated, so this is the build-time lever.
+ * Off forces the fmgr path (debug/benchmark; results numerically identical).
+ */
+bool acorn_build_direct_dist = true;
+
+/*
+ * GUC: deterministic build seed.  -1 (default) keeps the legacy PID-derived
+ * level-RNG seeding (every rebuild produces a different graph).  >= 0 seeds
+ * the level RNG deterministically: identical data + identical seed produce an
+ * identical index, enabling reproducible benchmarks and prebuilt index pools.
+ */
+int acorn_build_seed = -1;
+
+/*
  * GUC: Tier 2 scan fast-path toggle — prefetch neighbor pages per expansion.
  * Default OFF: measured -10..-13% QPS on warm shared_buffers (every
  * PrefetchBuffer is a redundant buffer-table lookup when the page is already
@@ -192,6 +209,37 @@ _PG_init(void)
 		NULL,
 		&acorn_scan_visited_oneprobe,
 		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.build_direct_dist */
+	DefineCustomBoolVariable(
+		"pg_acorn.build_direct_dist",
+		"Use direct C distance kernels (fmgr bypass) in acorn_hnsw index "
+		"builds and inserts for known pgvector distance functions.  Off "
+		"forces the fmgr path (debug/benchmark; results are numerically "
+		"identical).",
+		NULL,
+		&acorn_build_direct_dist,
+		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.build_seed */
+	DefineCustomIntVariable(
+		"pg_acorn.build_seed",
+		"Seed for the acorn_hnsw level RNG during index build. "
+		"-1 = legacy PID-derived seeding (each rebuild differs); "
+		">= 0 = deterministic builds for reproducible benchmarks.",
+		NULL,
+		&acorn_build_seed,
+		-1,			/* default: legacy PID-derived behavior */
+		-1,			/* min */
+		INT_MAX,	/* max */
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL

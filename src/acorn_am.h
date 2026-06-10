@@ -45,6 +45,7 @@ typedef struct AcornOptions
 	int			efConstruction;	/* candidate list size at build time */
 	int			gamma;			/* ACORN-gamma multiplier (m_eff = m*gamma) */
 	bool		payloadEdges;	/* split layer-0 slots: half global / half same-partition */
+	bool		diversify;		/* HNSW diversity heuristic in neighbor selection */
 } AcornOptions;
 
 /* -----------------------------------------------------------------------

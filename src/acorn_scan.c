@@ -306,7 +306,7 @@ acorn_load_dist_proc(Relation index, FmgrInfo *finfo)
  * so results are numerically identical to the fmgr path.  Returns NULL for
  * unknown opclasses — callers must keep the fmgr fallback.
  */
-static AcornDistFn
+AcornDistFn
 acorn_resolve_direct_dist(Relation index)
 {
 	Oid			procOid = (Oid) index->rd_support[0];

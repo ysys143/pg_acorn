@@ -61,6 +61,11 @@ acorn_am_init(void)
 					   "half nearest within the same payload partition",
 					   false,
 					   AccessExclusiveLock);
+	add_bool_reloption(acorn_relopt_kind, "acorn_diversify",
+					   "Apply the HNSW diversity heuristic (Malkov Alg. 4 with "
+					   "keepPrunedConnections) in neighbor selection",
+					   true,
+					   AccessExclusiveLock);
 }
 
 static bytea *
@@ -71,6 +76,7 @@ acorn_options(Datum reloptions, bool validate)
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(AcornOptions, efConstruction)},
 		{"acorn_gamma", RELOPT_TYPE_INT, offsetof(AcornOptions, gamma)},
 		{"acorn_payload_edges", RELOPT_TYPE_BOOL, offsetof(AcornOptions, payloadEdges)},
+		{"acorn_diversify", RELOPT_TYPE_BOOL, offsetof(AcornOptions, diversify)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,

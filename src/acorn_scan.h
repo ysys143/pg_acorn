@@ -6,6 +6,15 @@
 #include "nodes/execnodes.h"
 #include "utils/relcache.h"
 
+#include "acorn_dist.h"
+
+/*
+ * Resolve a direct C distance kernel (fmgr bypass) for the index's opclass
+ * support function 1.  Returns NULL for unknown opclasses — callers must keep
+ * the fmgr fallback.  Defined in acorn_scan.c; shared with the build path.
+ */
+AcornDistFn acorn_resolve_direct_dist(Relation index);
+
 /*
  * ACORN-1 predicate subgraph traversal.
  *
