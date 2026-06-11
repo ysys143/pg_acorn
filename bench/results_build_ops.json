@@ -1,0 +1,27 @@
+{
+ "meta": {
+  "n": 60000,
+  "dim": 128,
+  "stages": [
+   "rss"
+  ],
+  "build_seed": 42,
+  "data_seed": 42,
+  "config": "m=16 efc=64 gamma=2 payload_edges inline",
+  "started_utc": "2026-06-11T05:41:11Z"
+ },
+ "rss": {
+  "64MB": {
+   "pid": 122,
+   "vmhwm_pre_kb": 18776,
+   "vmhwm_post_kb": 1177688,
+   "build_s": 616.4
+  },
+  "2GB": {
+   "pid": 214,
+   "vmhwm_pre_kb": 18776,
+   "vmhwm_post_kb": 1178456,
+   "build_s": 608.3
+  }
+ }
+}

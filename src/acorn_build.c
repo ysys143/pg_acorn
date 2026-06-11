@@ -596,8 +596,16 @@ build_create_visited(void)
 	memset(&info, 0, sizeof(info));
 	info.keysize   = sizeof(ItemPointerData);
 	info.entrysize = sizeof(ItemPointerData) + 1;
+	info.hcxt      = CurrentMemoryContext;
+
+	/*
+	 * HASH_CONTEXT is essential: without it dynahash parks the table under
+	 * TopMemoryContext, so it outlives the per-search temp context and leaks
+	 * ~100KB per on-disk insert (measured 1.26GB peak RssAnon during a 60K
+	 * maintenance_work_mem spill tail vs 87MB for the full in-memory build).
+	 */
 	return hash_create("acorn_build_visited", 512, &info,
-					   HASH_ELEM | HASH_BLOBS);
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
 static bool
