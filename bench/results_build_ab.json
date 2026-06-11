@@ -1,0 +1,22 @@
+{
+ "meta": {
+  "dsn": "postgresql://postgres@localhost/postgres",
+  "n": 60000,
+  "dim": 128,
+  "diversify": false,
+  "ab_reps": 2,
+  "ab_only": true,
+  "out": "bench/results_build_ab.json"
+ },
+ "builds": {
+  "fmgr": [
+   308.5544530149782,
+   303.55583648197353
+  ],
+  "direct": [
+   253.38319696404506,
+   256.8147107749246
+  ]
+ },
+ "speedup": 1.2
+}

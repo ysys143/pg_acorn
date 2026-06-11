@@ -89,7 +89,7 @@ static bool
 acorn_opt_diversify(Relation index)
 {
 	AcornOptions *opts = (AcornOptions *) index->rd_options;
-	return opts ? opts->diversify : true;
+	return opts ? opts->diversify : false;
 }
 
 /* -----------------------------------------------------------------------
