@@ -1,0 +1,48 @@
+{
+ "meta": {
+  "n": 60000,
+  "dim": 128,
+  "stages": [
+   "workers",
+   "recall"
+  ],
+  "build_seed": 42,
+  "data_seed": 42,
+  "config": "m=16 efc=64 gamma=2 payload_edges inline",
+  "started_utc": "2026-06-11T07:07:36Z"
+ },
+ "workers_60k": {
+  "1": {
+   "build_s": 242.2,
+   "peak_parallel_workers": 1
+  },
+  "2": {
+   "build_s": 171.3,
+   "peak_parallel_workers": 2
+  },
+  "4": {
+   "build_s": 129.2,
+   "peak_parallel_workers": 4
+  }
+ },
+ "recall_60k": {
+  "100": {
+   "serial": 0.4575,
+   "parallel": 0.4925,
+   "delta": 0.035,
+   "within_0.02": false
+  },
+  "200": {
+   "serial": 0.545,
+   "parallel": 0.565,
+   "delta": 0.02,
+   "within_0.02": true
+  },
+  "400": {
+   "serial": 0.55,
+   "parallel": 0.5675,
+   "delta": 0.0175,
+   "within_0.02": true
+  }
+ }
+}

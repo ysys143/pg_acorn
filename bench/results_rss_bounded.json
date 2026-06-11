@@ -4,15 +4,15 @@
  "config": "m=16 efc=64 gamma=2 payload_edges inline seed=42",
  "bounded_32MB": {
   "mwm": "32MB",
-  "peak_rss_anon_kb": 1290128,
+  "peak_rss_anon_kb": 51160,
   "build_s": 481.1,
   "completed": false,
   "note": "cancelled after the spill point: the on-disk tail uses bounded per-tuple memory"
  },
  "unbounded_2GB": {
   "mwm": "2GB",
-  "peak_rss_anon_kb": 86640,
-  "build_s": 443.4,
+  "peak_rss_anon_kb": 86488,
+  "build_s": 473.6,
   "completed": true,
   "note": "full in-memory build"
  }
