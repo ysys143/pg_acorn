@@ -6,10 +6,12 @@
  * The Tier 2 scan consults the cache at neighbor discovery instead of
  * pinning the neighbor's element page (~20 us/access measured).
  *
- * M1 = read path only (docs/code-cache-design.md section 8).  The cache is
- * a hint, never an authority: any miss, a full directory, a LOADING slot in
- * another backend, or a disabled GUC degrades to the existing element-page
- * read — never to a wrong result.
+ * M1 = read path (load + lock-free lookup).  M2 = write path: aminsert
+ * upserts the new element's entry, ambulkdelete invalidates removed TIDs,
+ * and a per-entry seqlock makes those mutations safe against the lock-free
+ * reader.  The cache is a hint, never an authority: any miss, torn read,
+ * stale flag, growth-in-progress, full directory, LOADING slot, or disabled
+ * GUC degrades to the element-page read — never to a wrong result (G4).
  */
 
 #ifndef ACORN_CODECACHE_H
@@ -31,27 +33,56 @@
  * indextid (the entry's position in the per-block directory identifies the
  * element instead).  Codes are produced by acorn_sq8_encode, so they are
  * bit-identical to the codes the inline build co-locates.
+ *
+ * `version` is a seqlock (even = stable, odd = a writer is mid-update).  M2
+ * mutates entries in place on insert/vacuum; readers copy the fixed header +
+ * code out under the seqlock and retry once on an odd-or-changed version,
+ * then fall back to the element-page read.  The writer bumps version to odd
+ * before the first field write and back to even (a write barrier between)
+ * after the last, so a reader never observes a half-written entry.
  */
 typedef struct AcornCodeCacheEntry
 {
+	pg_atomic_uint32 version;	/* seqlock: even = stable, odd = writing */
 	ItemPointerData heaptid;	/* element's primary heap TID (heaptids[0]) */
 	ItemPointerData nbrtid;		/* element's own neighbor-tuple TID */
 	uint8			level;		/* element's highest layer */
 	uint8			flags;		/* ACORN_CC_* */
-	/* 2 bytes implicit padding (int64 below is 8-aligned at offset 16) */
+	/* 2 bytes implicit padding (int64 below is 8-aligned at offset 24) */
 	int64			filter_val;	/* inline filter value */
 	float			scale;		/* SQ8: x[i] ~ offset + scale * code[i] */
 	float			offset;
 	uint8			code[FLEXIBLE_ARRAY_MEMBER];	/* dim bytes */
 } AcornCodeCacheEntry;
 
-StaticAssertDecl(offsetof(AcornCodeCacheEntry, code) == 32,
-				 "AcornCodeCacheEntry codes must start at byte 32");
+StaticAssertDecl(offsetof(AcornCodeCacheEntry, code) == 40,
+				 "AcornCodeCacheEntry codes must start at byte 40");
+
+/*
+ * Caller-side copy target for a lookup hit.  The reader copies the fixed
+ * fields plus up to ACORN_CC_MAX_DIM code bytes out of shared memory under
+ * the entry seqlock, so the returned data is a stable snapshot the scan can
+ * use after any lock is dropped.
+ */
+#define ACORN_CC_MAX_DIM	2000		/* pgvector vector hard cap */
+
+typedef struct AcornCodeCacheHit
+{
+	ItemPointerData heaptid;
+	ItemPointerData nbrtid;
+	uint8			level;
+	uint8			flags;
+	int64			filter_val;
+	float			scale;
+	float			offset;
+	int				dim;
+	uint8			code[ACORN_CC_MAX_DIM];
+} AcornCodeCacheHit;
 
 /*
  * Opaque per-backend handle for one index's cache table.  Returned by
  * acorn_codecache_begin_scan; lives in TopMemoryContext for the backend's
- * lifetime (M1 has no eviction), so scans need no cleanup call.
+ * lifetime, so scans need no cleanup call.
  */
 typedef struct AcornCodeCacheScan AcornCodeCacheScan;
 
@@ -63,12 +94,33 @@ typedef struct AcornCodeCacheScan AcornCodeCacheScan;
 extern AcornCodeCacheScan *acorn_codecache_begin_scan(Relation index, int dim);
 
 /*
- * Look up one element by its index TID.  Returns NULL on miss (caller falls
- * back to the element-page read).  The returned entry is immutable and
- * never freed in M1, so it remains valid after the call.
+ * Look up one element by its index TID, copying a stable snapshot into *out.
+ * Returns true on a present hit, false on miss / not-present / torn read
+ * (caller falls back to the element-page read).
  */
-extern const AcornCodeCacheEntry *acorn_codecache_lookup(AcornCodeCacheScan *cc,
-														 BlockNumber blkno,
-														 OffsetNumber offno);
+extern bool acorn_codecache_lookup(AcornCodeCacheScan *cc,
+								   BlockNumber blkno, OffsetNumber offno,
+								   AcornCodeCacheHit *out);
+
+/*
+ * Write path (M2).  Both are no-ops unless a READY/PARTIAL slot for the
+ * index already exists in this postmaster — they never trigger a load, so
+ * an unwarmed index keeps the M1 "load lazily on first scan" behavior.
+ */
+
+/*
+ * Upsert one element's entry after aminsert has durably written its tuples.
+ * `vec`/`scale`-less: the encoder is applied internally so the cached code
+ * is bit-identical to the loader's and the inline build's.
+ */
+extern void acorn_codecache_insert(Relation index,
+								   BlockNumber blkno, OffsetNumber offno,
+								   const float *vec, int dim,
+								   ItemPointer heaptid, ItemPointer nbrtid,
+								   uint8 level, int64 filter_val);
+
+/* Invalidate one element's entry (ambulkdelete): clears PRESENT + DELETED. */
+extern void acorn_codecache_invalidate(Relation index,
+									   BlockNumber blkno, OffsetNumber offno);
 
 #endif							/* ACORN_CODECACHE_H */

@@ -1,0 +1,167 @@
+-- tier2_code_cache_dml.sql: shared-memory SQ8 code cache WRITE path (M2).
+--
+-- M1 loaded the cache once and never mutated it.  M2 keeps it coherent under
+-- DML: aminsert upserts the new element's entry, ambulkdelete (VACUUM) clears
+-- it, and a per-entry seqlock makes those mutations safe against the lock-free
+-- scan reader.  Correctness invariant (G4): cache state never changes a
+-- result.  These tests force the cache ON and compare its ordered top-k id
+-- list to the cache-OFF truth on the SAME post-DML index state — they must be
+-- byte-identical (distinct random vectors => no distance ties => identity, not
+-- just recall).
+--
+-- Coverage: (a) warm cache, INSERT new rows, query; (b) DELETE + VACUUM,
+-- query (no stale rows); (c) TID-reuse: DELETE, VACUUM, INSERT reusing slots,
+-- query.  Each compared to the cache-off truth at exhaustive ef_search.
+\set ON_ERROR_STOP on
+\set q '[0.11,0.23,0.31,0.42,0.55,0.63,0.74,0.81]'
+CREATE SCHEMA test_tier2_cc_dml;
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+NOTICE:  extension "pg_acorn" already exists, skipping
+SET search_path = test_tier2_cc_dml, public;
+SELECT setseed(0.137);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    bucket    int,
+    embedding vector(8)
+);
+INSERT INTO items (bucket, embedding) SELECT
+    (i % 10),
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 600) i;
+-- NON-inline deterministic index (cache serves only non-inline layouts).
+SET pg_acorn.build_seed = 137;
+SET max_parallel_maintenance_workers = 0;
+CREATE INDEX items_dml_idx ON items
+    USING acorn_hnsw (embedding vector_l2_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2);
+RESET pg_acorn.build_seed;
+-- Ordered top-10 id list at the session's cache setting + ef_search.
+-- ef_search high enough to drain the frontier so emission order is exact.
+CREATE FUNCTION topk(cache bool) RETURNS int[] AS $$
+DECLARE
+    r int[];
+BEGIN
+    EXECUTE format('SET pg_acorn.scan_code_cache = %s', cache);
+    SET enable_seqscan = off;
+    SET pg_acorn.ef_search = 4000;
+    SELECT array_agg(id) INTO r FROM (
+        SELECT id FROM items WHERE bucket < 3
+        ORDER BY embedding <-> '[0.11,0.23,0.31,0.42,0.55,0.63,0.74,0.81]'::vector
+        LIMIT 10) t;
+    RESET enable_seqscan;
+    RESET pg_acorn.ef_search;
+    RESET pg_acorn.scan_code_cache;
+    RETURN r;
+END;
+$$ LANGUAGE plpgsql;
+-- Warm the cache (cache-on scan loads the slot to READY), then confirm
+-- baseline: cache-on == cache-off on the loaded index.
+SELECT topk(true) = topk(false) AS baseline_identical;
+ baseline_identical 
+--------------------
+ t
+(1 row)
+
+-- (a) INSERT new rows AFTER the cache is warm.  aminsert upserts the new
+-- element entries (new block indices / offsets => directory + page growth).
+-- Cache-on must still equal cache-off truth, including any new rows that
+-- belong in the top-10.
+INSERT INTO items (bucket, embedding) SELECT
+    (i % 10),
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(601, 750) i;
+-- Force an exact near-duplicate of the query into a filtered bucket: it must
+-- become the nearest result, proving the upserted entry is consulted.
+INSERT INTO items (bucket, embedding) VALUES
+    (0, '[0.11,0.23,0.31,0.42,0.55,0.63,0.74,0.81]'::vector);
+SELECT topk(true) = topk(false) AS after_insert_identical;
+ after_insert_identical 
+------------------------
+ t
+(1 row)
+
+SELECT (topk(true))[1] = (SELECT max(id) FROM items) AS inserted_exact_is_nearest;
+ inserted_exact_is_nearest 
+---------------------------
+ t
+(1 row)
+
+-- (b) DELETE + VACUUM: ambulkdelete must clear the removed elements' cache
+-- entries so they never surface.  Capture the 5 nearest filtered ids, delete
+-- them, VACUUM, then query.
+CREATE TABLE deleted_ids AS
+    SELECT id FROM items WHERE bucket < 3
+    ORDER BY embedding <-> :'q'::vector LIMIT 5;
+DELETE FROM items WHERE id IN (SELECT id FROM deleted_ids);
+VACUUM items;
+SELECT topk(true) = topk(false) AS after_delete_identical;
+ after_delete_identical 
+------------------------
+ t
+(1 row)
+
+-- No deleted id may appear in the cache-on result.
+SELECT NOT (topk(true) && ARRAY(SELECT id FROM deleted_ids)) AS no_deleted_rows;
+ no_deleted_rows 
+-----------------
+ t
+(1 row)
+
+-- (c) TID reuse: VACUUM freed element slots; new inserts reuse those
+-- (blkno,offno).  The reused entry must be fully overwritten (code + meta)
+-- and re-present.  Insert a fresh batch including another exact query match.
+INSERT INTO items (bucket, embedding) SELECT
+    0,
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 30) i;
+INSERT INTO items (bucket, embedding) VALUES
+    (0, '[0.11,0.23,0.31,0.42,0.55,0.63,0.74,0.81]'::vector);
+SELECT topk(true) = topk(false) AS after_tid_reuse_identical;
+ after_tid_reuse_identical 
+---------------------------
+ t
+(1 row)
+
+SELECT (topk(true))[1] = (SELECT max(id) FROM items) AS reuse_exact_is_nearest;
+ reuse_exact_is_nearest 
+------------------------
+ t
+(1 row)
+
+-- Filter correctness still holds with the cache on after all DML.
+SET pg_acorn.scan_code_cache = on;
+SET pg_acorn.ef_search = 400;
+SET enable_seqscan = off;
+SELECT bool_and(bucket < 3) AS filter_correct,
+       count(*) = 10        AS returns_k
+FROM (SELECT bucket FROM items WHERE bucket < 3
+      ORDER BY embedding <-> :'q'::vector LIMIT 10) r;
+ filter_correct | returns_k 
+----------------+-----------
+ t              | t
+(1 row)
+
+RESET enable_seqscan;
+RESET pg_acorn.ef_search;
+RESET pg_acorn.scan_code_cache;
+DROP SCHEMA test_tier2_cc_dml CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table items
+drop cascades to function topk(boolean)
+drop cascades to table deleted_ids

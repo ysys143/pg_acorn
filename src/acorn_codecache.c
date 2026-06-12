@@ -1,21 +1,19 @@
 /*
- * acorn_codecache.c — per-index shared-memory SQ8 code cache (M1: read path)
+ * acorn_codecache.c — per-index shared-memory SQ8 code cache (M1 read + M2 write)
  *
  * Registry: one named DSM segment ("pg_acorn_cc", PG17 dsm_registry) holds a
  * directory of per-index slots keyed by (dboid, relfilenumber).  Each slot
  * owns a DSA area containing a flat per-block directory: a dsa_pointer array
  * indexed by block number, each pointing to a fixed-stride array of entries
- * indexed by (offno - 1).  An entry holds heaptid, nbrtid, level, flags,
- * filter_val and the SQ8 scale/offset/code.
+ * indexed by (offno - 1).  An entry holds a seqlock version, heaptid, nbrtid,
+ * level, flags, filter_val and the SQ8 scale/offset/code.
  *
  * The flat layout replaces the dshash the design doc sketched: a lookup is
- * two dependent loads with NO lock and NO hashing, which matters because the
- * scan does one lookup per discovered neighbor (measured at 60K/dim=128:
- * dshash_find + per-entry dsa pointer chase cost ~0.9 us per discovery and
- * put cache-mode at ~2.5x inline-mode latency; the flat directory is the
- * same access pattern as the inline path's in-page entry read).  M2's write
- * path fits the layout: upsert writes a slot in place, vacuum invalidation
- * clears the PRESENT flag, both under entry versioning.
+ * two dependent loads with NO partition lock and NO hashing, which matters
+ * because the scan does one lookup per discovered neighbor (measured at
+ * 60K/dim=128: dshash_find + per-entry dsa pointer chase cost ~0.9 us per
+ * discovery and put cache-mode at ~2.5x inline-mode latency; the flat
+ * directory is the same access pattern as the inline path's in-page read).
  *
  * Loading is lazy and non-blocking: the first scan that finds a slot EMPTY
  * CASes it to LOADING and walks the index main fork, quantizing every
@@ -26,22 +24,27 @@
  * pg_acorn.code_cache_size budget is exceeded mid-load the slot becomes
  * PARTIAL: present blocks serve, misses fall back.
  *
- * Locking contract: dir->lock (exclusive) protects slot claiming and handle
- * publication, (shared) handle reads.  Slot state transitions go through
- * the atomic only: EMPTY -> LOADING by CAS (single loader), LOADING ->
- * READY|PARTIAL by the loader after a write barrier.  Per-slot storage
- * needs no locks at all: it has a single writer (the LOADING owner) and is
- * immutable once the state leaves LOADING; readers attach only after
- * observing READY/PARTIAL.
+ * Locking contract:
+ *   - dir->lock (exclusive) protects slot claiming and handle publication,
+ *     (shared) handle reads.
+ *   - Slot state transitions go through the atomic only: EMPTY -> LOADING by
+ *     CAS (single loader), LOADING -> READY|PARTIAL by the loader after a
+ *     write barrier.
+ *   - slot->wlock (a per-slot LWLock) serializes M2 writers (insert/vacuum)
+ *     against each other and against directory/page-array growth.  Readers
+ *     take NO lock: they snapshot the block directory and copy each entry
+ *     out under its per-entry seqlock (acorn_cc_entry_version), retrying once
+ *     then falling back.  Growth publishes a fully-built replacement array
+ *     and swaps the owning dsa_pointer atomically, so a lock-free reader
+ *     observes either the old or the new array — both internally consistent.
  *
- * M1 caveats (fixed in M2 — do not rely on the cache for correctness):
- *   - no insert upsert: elements inserted after the load are misses, which
- *     fall back to the element-page read (correct, just slower);
- *   - no vacuum invalidation: an index TID reused after VACUUM could serve
- *     a stale entry.  Acceptable while pg_acorn.scan_code_cache defaults
- *     off; M2 adds ambulkdelete invalidation + entry versioning.  Stale
- *     deleted flags / heaptids are partially masked by the exact re-rank,
- *     which re-reads the element page before emission.
+ * M2 caveats (M3):
+ *   - Growth (new block index or a page array that must hold a larger offno)
+ *     leaks the superseded array within the slot's own DSA until M3 eviction
+ *     reclaims the whole slot.  Bounded by the number of growth events, not
+ *     by query volume.
+ *   - No eviction / LRU / stats SRF yet.  pg_acorn.scan_code_cache still
+ *     defaults OFF; M3 flips it after acceptance.
  */
 
 #include "postgres.h"
@@ -94,6 +97,40 @@ typedef struct AcornCCPageHdr
 	((AcornCodeCacheEntry *) ((char *) (hdr) + sizeof(AcornCCPageHdr) + \
 							  (Size) ((offno) - 1) * (stride)))
 
+/*
+ * Grow page arrays with headroom so a run of inserts onto the same heap
+ * block does not realloc the cache page array on every tuple.  pgvector HNSW
+ * packs few element tuples per index page (one per page at dim=128), so this
+ * is small in absolute terms but avoids O(n^2) churn on pathological pages.
+ */
+#define ACORN_CC_PAGE_GROW(need)	((need) + 8)
+
+/* Grow the block directory with headroom (same rationale, per-block). */
+#define ACORN_CC_DIR_GROW(need)		((need) + 64)
+
+/* -----------------------------------------------------------------------
+ * Per-entry seqlock: the writer (insert/vacuum, holding slot->wlock) makes
+ * the version odd before the first field write and even (== old + 2) after
+ * the last, with a write barrier on each side.  A reader copies the entry
+ * out between two even reads of the same version; an odd or changed version
+ * means a concurrent write, so the reader retries once then falls back.
+ * ----------------------------------------------------------------------- */
+
+static inline void
+acorn_cc_write_begin(AcornCodeCacheEntry *e)
+{
+	pg_atomic_write_u32(&e->version, pg_atomic_read_u32(&e->version) | 1);
+	pg_write_barrier();
+}
+
+static inline void
+acorn_cc_write_end(AcornCodeCacheEntry *e)
+{
+	pg_write_barrier();
+	pg_atomic_write_u32(&e->version,
+						(pg_atomic_read_u32(&e->version) & ~(uint32) 1) + 2);
+}
+
 typedef struct AcornCodeCacheSlot
 {
 	Oid				dboid;			/* InvalidOid = slot unclaimed */
@@ -102,10 +139,11 @@ typedef struct AcornCodeCacheSlot
 	uint32			generation;		/* bumped per (re)load */
 	uint32			nelems;
 	uint64			bytes;			/* accounted bytes */
-	int				dim;			/* code length; stride = 32 + dim aligned */
-	uint32			nblocks;		/* length of the block directory */
+	int				dim;			/* code length; stride = 40 + dim aligned */
+	pg_atomic_uint32 nblocks;		/* length of the block directory (grows) */
+	LWLock			wlock;			/* serializes M2 writers + growth */
 	dsa_handle		area_handle;
-	dsa_pointer		blocks;			/* dsa_pointer[nblocks] page arrays */
+	pg_atomic_uint64 blocks;		/* dsa_pointer[nblocks] page arrays (grows) */
 } AcornCodeCacheSlot;
 
 typedef struct AcornCodeCacheDirectory
@@ -113,6 +151,7 @@ typedef struct AcornCodeCacheDirectory
 	LWLock			lock;
 	int				lock_tranche;
 	int				dsa_tranche;
+	int				wlock_tranche;
 	pg_atomic_uint64 total_bytes;	/* global accounted bytes, all slots */
 	AcornCodeCacheSlot slots[ACORN_CC_NSLOTS];
 } AcornCodeCacheDirectory;
@@ -124,9 +163,12 @@ typedef struct AcornCodeCacheDirectory
 struct AcornCodeCacheScan
 {
 	dsa_area	   *area;
-	dsa_pointer    *blocks;			/* mapped block directory */
-	uint32			nblocks;
+	AcornCodeCacheSlot *slot;		/* live slot (for growth-aware lookup) */
+	dsa_pointer		blocks_dp;		/* snapshot of slot->blocks at attach */
+	dsa_pointer    *blocks;			/* mapped block directory snapshot */
+	uint32			nblocks;		/* snapshot of slot->nblocks at attach */
 	Size			stride;
+	int				dim;			/* code length */
 };
 
 typedef struct AcornCCAttachKey
@@ -156,10 +198,16 @@ acorn_cc_dir_init(void *ptr)
 	memset(dir, 0, sizeof(AcornCodeCacheDirectory));
 	dir->lock_tranche = LWLockNewTrancheId();
 	dir->dsa_tranche = LWLockNewTrancheId();
+	dir->wlock_tranche = LWLockNewTrancheId();
 	LWLockInitialize(&dir->lock, dir->lock_tranche);
 	pg_atomic_init_u64(&dir->total_bytes, 0);
 	for (int i = 0; i < ACORN_CC_NSLOTS; i++)
+	{
 		pg_atomic_init_u32(&dir->slots[i].state, ACORN_CC_STATE_EMPTY);
+		pg_atomic_init_u32(&dir->slots[i].nblocks, 0);
+		pg_atomic_init_u64(&dir->slots[i].blocks, InvalidDsaPointer);
+		LWLockInitialize(&dir->slots[i].wlock, dir->wlock_tranche);
+	}
 }
 
 static AcornCodeCacheDirectory *
@@ -175,6 +223,7 @@ acorn_cc_get_dir(void)
 							   acorn_cc_dir_init, &found);
 		LWLockRegisterTranche(acorn_cc_dir->lock_tranche, "pg_acorn_cc_dir");
 		LWLockRegisterTranche(acorn_cc_dir->dsa_tranche, "pg_acorn_cc_dsa");
+		LWLockRegisterTranche(acorn_cc_dir->wlock_tranche, "pg_acorn_cc_wlock");
 	}
 	return acorn_cc_dir;
 }
@@ -248,8 +297,9 @@ acorn_cc_attach_find(Oid dboid, RelFileNumber relnumber, bool *found)
 
 static AcornCCAttachEntry *
 acorn_cc_attach_store(Oid dboid, RelFileNumber relnumber,
-					  dsa_area *area, dsa_pointer *blocks,
-					  uint32 nblocks, Size stride)
+					  dsa_area *area, AcornCodeCacheSlot *slot,
+					  dsa_pointer blocks_dp, dsa_pointer *blocks,
+					  uint32 nblocks, Size stride, int dim)
 {
 	AcornCCAttachKey key;
 	AcornCCAttachEntry *e;
@@ -262,9 +312,12 @@ acorn_cc_attach_store(Oid dboid, RelFileNumber relnumber,
 	e = (AcornCCAttachEntry *)
 		hash_search(acorn_cc_attached, &key, HASH_ENTER, &found);
 	e->scan.area = area;
+	e->scan.slot = slot;
+	e->scan.blocks_dp = blocks_dp;
 	e->scan.blocks = blocks;
 	e->scan.nblocks = nblocks;
 	e->scan.stride = stride;
+	e->scan.dim = dim;
 	return e;
 }
 
@@ -294,10 +347,12 @@ acorn_cc_attach(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 
 	LWLockAcquire(&dir->lock, LW_SHARED);
 	area_handle = slot->area_handle;
-	blocks_dp = slot->blocks;
-	nblocks = slot->nblocks;
 	dim = slot->dim;
 	LWLockRelease(&dir->lock);
+
+	/* blocks/nblocks grow lock-free; read them via their atomics */
+	blocks_dp = (dsa_pointer) pg_atomic_read_u64(&slot->blocks);
+	nblocks = pg_atomic_read_u32(&slot->nblocks);
 
 	old = MemoryContextSwitchTo(TopMemoryContext);
 	area = dsa_attach(area_handle);
@@ -305,8 +360,8 @@ acorn_cc_attach(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 	MemoryContextSwitchTo(old);
 	blocks = (dsa_pointer *) dsa_get_address(area, blocks_dp);
 
-	e = acorn_cc_attach_store(dboid, relnumber, area, blocks, nblocks,
-							  ACORN_CC_ENTRY_STRIDE(dim));
+	e = acorn_cc_attach_store(dboid, relnumber, area, slot, blocks_dp,
+							  blocks, nblocks, ACORN_CC_ENTRY_STRIDE(dim), dim);
 	return &e->scan;
 }
 
@@ -345,23 +400,34 @@ acorn_cc_load(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 	dsa_pin_mapping(area);
 	MemoryContextSwitchTo(old);
 
-	blocks_dp = dsa_allocate0(area, (Size) nblocks * sizeof(dsa_pointer));
-	blocks = (dsa_pointer *) dsa_get_address(area, blocks_dp);
-	bytes += (Size) nblocks * sizeof(dsa_pointer);
+	/*
+	 * Over-allocate the block directory by the index's current page count
+	 * plus headroom, so the common insert-onto-a-new-block case sets a slot
+	 * in place without growing the directory.
+	 */
+	{
+		uint32	dir_blocks = ACORN_CC_DIR_GROW(nblocks);
 
-	/* publish handles before the state can leave LOADING */
-	LWLockAcquire(&dir->lock, LW_EXCLUSIVE);
-	slot->area_handle = dsa_get_handle(area);
-	slot->blocks = blocks_dp;
-	slot->nblocks = nblocks;
-	slot->dim = dim;
-	slot->generation++;
-	LWLockRelease(&dir->lock);
+		blocks_dp = dsa_allocate0(area,
+								  (Size) dir_blocks * sizeof(dsa_pointer));
+		blocks = (dsa_pointer *) dsa_get_address(area, blocks_dp);
+		bytes += (Size) dir_blocks * sizeof(dsa_pointer);
 
-	/* the loading backend is attached by construction */
-	acorn_cc_attach_store(index->rd_locator.dbOid,
-						  index->rd_locator.relNumber, area, blocks,
-						  nblocks, stride);
+		/* publish handles before the state can leave LOADING */
+		LWLockAcquire(&dir->lock, LW_EXCLUSIVE);
+		slot->area_handle = dsa_get_handle(area);
+		slot->dim = dim;
+		slot->generation++;
+		LWLockRelease(&dir->lock);
+
+		pg_atomic_write_u64(&slot->blocks, (uint64) blocks_dp);
+		pg_atomic_write_u32(&slot->nblocks, dir_blocks);
+
+		/* the loading backend is attached by construction */
+		acorn_cc_attach_store(index->rd_locator.dbOid,
+							  index->rd_locator.relNumber, area, slot,
+							  blocks_dp, blocks, dir_blocks, stride, dim);
+	}
 
 	other_bytes = pg_atomic_read_u64(&dir->total_bytes);
 
@@ -426,6 +492,12 @@ acorn_cc_load(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 				}
 
 				e = ACORN_CC_PAGE_ENTRY(ph, offno, stride);
+				/*
+				 * Loader builds entries before the block is reachable, so no
+				 * seqlock is needed here — but initialise version to an even
+				 * value so the M2 writer's odd/even toggling starts correctly.
+				 */
+				pg_atomic_init_u32(&e->version, 0);
 				e->heaptid = etup->heaptids[0];
 				e->nbrtid = etup->neighbortid;
 				e->level = etup->level;
@@ -530,30 +602,395 @@ acorn_codecache_begin_scan(Relation index, int dim)
 	return acorn_cc_attach(dir, slot, dboid, relnumber);
 }
 
-const AcornCodeCacheEntry *
-acorn_codecache_lookup(AcornCodeCacheScan *cc,
-					   BlockNumber blkno, OffsetNumber offno)
+/*
+ * Resolve the block directory for `blkno`, honoring lock-free growth.
+ *
+ * The backend-local snapshot (cc->blocks/cc->nblocks) is the fast path; it
+ * covers every block present at attach time.  An insert may have grown the
+ * directory since — if the snapshot is out of range or shows no page yet,
+ * re-read the slot's live (atomic) directory and refresh the snapshot.  This
+ * keeps long-lived backends serving newly inserted elements without forcing
+ * a slot lookup on the hot per-discovery path.
+ */
+static dsa_pointer *
+acorn_cc_resolve_blocks(AcornCodeCacheScan *cc, BlockNumber blkno)
 {
-	dsa_pointer page_dp;
-	AcornCCPageHdr *ph;
-	const AcornCodeCacheEntry *e;
+	dsa_pointer	live_dp;
+	uint32		live_nblocks;
+
+	if (blkno < cc->nblocks && DsaPointerIsValid(cc->blocks[blkno]))
+		return cc->blocks;
+
+	/* Snapshot miss: consult the live directory (may have grown). */
+	live_dp = (dsa_pointer) pg_atomic_read_u64(&cc->slot->blocks);
+	live_nblocks = pg_atomic_read_u32(&cc->slot->nblocks);
+	pg_read_barrier();
+
+	if (live_dp != cc->blocks_dp)
+	{
+		cc->blocks_dp = live_dp;
+		cc->blocks = (dsa_pointer *) dsa_get_address(cc->area, live_dp);
+	}
+	cc->nblocks = live_nblocks;
 
 	if (blkno >= cc->nblocks)
 		return NULL;
-	page_dp = cc->blocks[blkno];
+	return cc->blocks;
+}
+
+bool
+acorn_codecache_lookup(AcornCodeCacheScan *cc,
+					   BlockNumber blkno, OffsetNumber offno,
+					   AcornCodeCacheHit *out)
+{
+	dsa_pointer *blocks;
+	dsa_pointer page_dp;
+	AcornCCPageHdr *ph;
+	AcornCodeCacheEntry *e;
+	int			dim = cc->dim;
+
+	if (dim <= 0 || dim > ACORN_CC_MAX_DIM)
+		return false;
+
+	blocks = acorn_cc_resolve_blocks(cc, blkno);
+	if (blocks == NULL)
+		return false;
+	page_dp = blocks[blkno];
 	if (!DsaPointerIsValid(page_dp))
-		return NULL;
+		return false;
 	ph = (AcornCCPageHdr *) dsa_get_address(cc->area, page_dp);
 	if (offno < 1 || offno > ph->nslots)
-		return NULL;
+		return false;
 	e = ACORN_CC_PAGE_ENTRY(ph, offno, cc->stride);
-	if ((e->flags & ACORN_CC_PRESENT) == 0)
-		return NULL;
 
 	/*
-	 * Safe to dereference after return: M1 entries are immutable and never
-	 * freed (no eviction, no vacuum invalidation).  M2 entry versioning
-	 * revisits this contract.
+	 * Seqlock copy-out: read an even version, copy the fixed header + code,
+	 * then re-read; an odd or changed version means a concurrent
+	 * insert/vacuum touched this entry, so fall back (G4).  One retry covers
+	 * the common case where the snapshot landed mid-write; persistent churn
+	 * (never in M2's single-writer-per-slot path) falls back too.
 	 */
-	return e;
+	for (int attempt = 0; attempt < 2; attempt++)
+	{
+		uint32	v0 = pg_atomic_read_u32(&e->version);
+		uint32	v1;
+
+		if (v0 & 1)
+			continue;			/* writer in progress */
+		pg_read_barrier();
+
+		if ((e->flags & ACORN_CC_PRESENT) == 0 ||
+			(e->flags & ACORN_CC_DELETED) != 0)
+		{
+			/* re-check version: a concurrent insert may be turning a
+			 * vacuumed slot back into a live one */
+			pg_read_barrier();
+			if (pg_atomic_read_u32(&e->version) != v0)
+				continue;
+			return false;
+		}
+
+		out->heaptid = e->heaptid;
+		out->nbrtid = e->nbrtid;
+		out->level = e->level;
+		out->flags = e->flags;
+		out->filter_val = e->filter_val;
+		out->scale = e->scale;
+		out->offset = e->offset;
+		out->dim = dim;
+		memcpy(out->code, e->code, dim);
+
+		pg_read_barrier();
+		v1 = pg_atomic_read_u32(&e->version);
+		if (v1 == v0)
+			return true;		/* stable snapshot */
+		/* changed under us: retry once, then fall back */
+	}
+	return false;
+}
+
+/* -----------------------------------------------------------------------
+ * Write path (M2): aminsert upsert + ambulkdelete invalidate
+ *
+ * Both run in the backend that just modified the index, after the index
+ * tuples are durably written.  They are best-effort cache maintenance:
+ * never load, never error on a full directory or unwarmed slot — those
+ * simply leave the cache as-is, and the affected lookups fall back to the
+ * element-page read (G4).
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Find an existing READY/PARTIAL slot for (dboid, relnumber) and ensure this
+ * backend is attached as a writer (area mapped, slot ref cached).  Returns
+ * the backend-local scan handle, or NULL when there is no warm slot to
+ * maintain (no cache exists yet — the next scan will lazily load a complete
+ * snapshot, so skipping the write is correct, not a lost update).
+ */
+static AcornCodeCacheScan *
+acorn_cc_writer_attach(Relation index)
+{
+	AcornCodeCacheDirectory *dir;
+	AcornCodeCacheSlot *slot = NULL;
+	Oid			dboid = index->rd_locator.dbOid;
+	RelFileNumber relnumber = index->rd_locator.relNumber;
+	AcornCCAttachEntry *att;
+	bool		found;
+	uint32		state;
+
+	if (acorn_code_cache_size_mb <= 0)
+		return NULL;
+
+	att = acorn_cc_attach_find(dboid, relnumber, &found);
+	if (found)
+		return &att->scan;
+
+	if (acorn_cc_dir == NULL)
+		return NULL;			/* directory never created => no warm slot */
+	dir = acorn_cc_dir;
+
+	LWLockAcquire(&dir->lock, LW_SHARED);
+	for (int i = 0; i < ACORN_CC_NSLOTS; i++)
+	{
+		AcornCodeCacheSlot *s = &dir->slots[i];
+
+		if (s->dboid == dboid && s->relnumber == relnumber)
+		{
+			slot = s;
+			break;
+		}
+	}
+	LWLockRelease(&dir->lock);
+	if (slot == NULL)
+		return NULL;
+
+	state = pg_atomic_read_u32(&slot->state);
+	if (state != ACORN_CC_STATE_READY && state != ACORN_CC_STATE_PARTIAL)
+		return NULL;			/* EMPTY/LOADING: let the loader build it */
+
+	return acorn_cc_attach(dir, slot, dboid, relnumber);
+}
+
+/*
+ * Grow the slot's block directory to cover at least `need` blocks.  Caller
+ * holds slot->wlock.  Publishes a fully-populated replacement array and
+ * swaps slot->blocks atomically, so a lock-free reader sees either the old
+ * (smaller) or the new (larger) array, both internally consistent.  The old
+ * array leaks within the slot's DSA until M3 eviction.
+ */
+static void
+acorn_cc_grow_dir(AcornCodeCacheDirectory *dir, AcornCodeCacheScan *cc,
+				  uint32 need)
+{
+	AcornCodeCacheSlot *slot = cc->slot;
+	uint32		old_n = pg_atomic_read_u32(&slot->nblocks);
+	uint32		new_n;
+	dsa_pointer old_dp;
+	dsa_pointer new_dp;
+	dsa_pointer *old_blocks;
+	dsa_pointer *new_blocks;
+
+	if (need <= old_n)
+		return;
+	new_n = ACORN_CC_DIR_GROW(need);
+	old_dp = (dsa_pointer) pg_atomic_read_u64(&slot->blocks);
+	old_blocks = (dsa_pointer *) dsa_get_address(cc->area, old_dp);
+
+	new_dp = dsa_allocate0(cc->area, (Size) new_n * sizeof(dsa_pointer));
+	new_blocks = (dsa_pointer *) dsa_get_address(cc->area, new_dp);
+	memcpy(new_blocks, old_blocks, (Size) old_n * sizeof(dsa_pointer));
+
+	pg_write_barrier();
+	pg_atomic_write_u64(&slot->blocks, (uint64) new_dp);
+	pg_atomic_write_u32(&slot->nblocks, new_n);
+	slot->bytes += (Size) new_n * sizeof(dsa_pointer);
+	pg_atomic_fetch_add_u64(&dir->total_bytes,
+							(uint64) new_n * sizeof(dsa_pointer));
+
+	/* refresh this backend's snapshot */
+	cc->blocks_dp = new_dp;
+	cc->blocks = new_blocks;
+	cc->nblocks = new_n;
+}
+
+/*
+ * Ensure the page array for `blkno` exists and can index `offno`.  Caller
+ * holds slot->wlock.  Returns the (possibly newly allocated/grown) page
+ * header, or NULL if the cache budget is exhausted (caller skips the write;
+ * the slot stays usable for every other element).  A grown page array is
+ * published by atomic dsa_pointer swap; the old array leaks (M3).
+ */
+static AcornCCPageHdr *
+acorn_cc_ensure_page(AcornCodeCacheDirectory *dir, AcornCodeCacheScan *cc,
+					 BlockNumber blkno, OffsetNumber offno)
+{
+	AcornCodeCacheSlot *slot = cc->slot;
+	uint64		budget = (uint64) acorn_code_cache_size_mb * 1024 * 1024;
+	dsa_pointer live_dp;
+	dsa_pointer page_dp;
+	AcornCCPageHdr *ph;
+
+	/*
+	 * Refresh this backend's directory snapshot from the live slot: another
+	 * backend may have grown it since we attached, leaving cc->blocks
+	 * pointing at a superseded (still-valid but stale) array.  We hold
+	 * slot->wlock, so no concurrent grower can move it out from under us.
+	 */
+	live_dp = (dsa_pointer) pg_atomic_read_u64(&slot->blocks);
+	if (live_dp != cc->blocks_dp)
+	{
+		cc->blocks_dp = live_dp;
+		cc->blocks = (dsa_pointer *) dsa_get_address(cc->area, live_dp);
+	}
+	cc->nblocks = pg_atomic_read_u32(&slot->nblocks);
+
+	if (blkno >= cc->nblocks)
+		acorn_cc_grow_dir(dir, cc, blkno + 1);
+
+	page_dp = cc->blocks[blkno];
+	if (DsaPointerIsValid(page_dp))
+	{
+		ph = (AcornCCPageHdr *) dsa_get_address(cc->area, page_dp);
+		if (offno <= ph->nslots)
+			return ph;			/* fits the existing array */
+
+		/* grow the page array to hold offno */
+		{
+			uint16	new_nslots = ACORN_CC_PAGE_GROW(offno);
+			Size	new_sz = ACORN_CC_PAGE_SIZE(new_nslots, cc->stride);
+			Size	old_sz = ACORN_CC_PAGE_SIZE(ph->nslots, cc->stride);
+			dsa_pointer new_dp;
+			AcornCCPageHdr *new_ph;
+
+			if (pg_atomic_read_u64(&dir->total_bytes) + (new_sz - old_sz) > budget)
+				return NULL;
+			new_dp = dsa_allocate_extended(cc->area, new_sz,
+										   DSA_ALLOC_NO_OOM | DSA_ALLOC_ZERO);
+			if (!DsaPointerIsValid(new_dp))
+				return NULL;
+			new_ph = (AcornCCPageHdr *) dsa_get_address(cc->area, new_dp);
+			memcpy(new_ph, ph, old_sz);
+			new_ph->nslots = new_nslots;
+
+			pg_write_barrier();
+			cc->blocks[blkno] = new_dp;	/* atomic pointer-width store */
+			slot->bytes += (new_sz - old_sz);
+			pg_atomic_fetch_add_u64(&dir->total_bytes, new_sz - old_sz);
+			return new_ph;
+		}
+	}
+
+	/* no page array yet: allocate one sized for offno */
+	{
+		uint16	nslots = ACORN_CC_PAGE_GROW(offno);
+		Size	page_sz = ACORN_CC_PAGE_SIZE(nslots, cc->stride);
+
+		if (pg_atomic_read_u64(&dir->total_bytes) + page_sz > budget)
+			return NULL;
+		page_dp = dsa_allocate_extended(cc->area, page_sz,
+										DSA_ALLOC_NO_OOM | DSA_ALLOC_ZERO);
+		if (!DsaPointerIsValid(page_dp))
+			return NULL;
+		ph = (AcornCCPageHdr *) dsa_get_address(cc->area, page_dp);
+		ph->nslots = nslots;
+
+		pg_write_barrier();
+		cc->blocks[blkno] = page_dp;	/* publish the new page array */
+		slot->bytes += page_sz;
+		pg_atomic_fetch_add_u64(&dir->total_bytes, page_sz);
+		return ph;
+	}
+}
+
+void
+acorn_codecache_insert(Relation index,
+					   BlockNumber blkno, OffsetNumber offno,
+					   const float *vec, int dim,
+					   ItemPointer heaptid, ItemPointer nbrtid,
+					   uint8 level, int64 filter_val)
+{
+	AcornCodeCacheScan *cc;
+	AcornCodeCacheDirectory *dir = acorn_cc_dir;
+	AcornCCPageHdr *ph;
+	AcornCodeCacheEntry *e;
+
+	cc = acorn_cc_writer_attach(index);
+	if (cc == NULL || cc->dim != dim)
+		return;					/* no warm slot / dim mismatch: skip (G4) */
+
+	LWLockAcquire(&cc->slot->wlock, LW_EXCLUSIVE);
+
+	ph = acorn_cc_ensure_page(dir, cc, blkno, offno);
+	if (ph == NULL)
+	{
+		LWLockRelease(&cc->slot->wlock);
+		return;					/* budget exhausted: element stays a miss */
+	}
+
+	e = ACORN_CC_PAGE_ENTRY(ph, offno, cc->stride);
+
+	/*
+	 * Seqlock write: bump version odd, write every field (TID reuse fully
+	 * overwrites a previously vacuumed slot's code+meta), set PRESENT (and
+	 * clear DELETED) implicitly via flags, then bump version even.  PRESENT
+	 * becomes visible only at write_end's barrier, so a concurrent reader
+	 * either sees the whole old entry, the whole new entry, or an odd
+	 * version (-> retry/fallback).  Never a torn mix.
+	 */
+	acorn_cc_write_begin(e);
+	e->heaptid = *heaptid;
+	e->nbrtid = *nbrtid;
+	e->level = level;
+	e->filter_val = filter_val;
+	acorn_sq8_encode(dim, vec, e->code, &e->scale, &e->offset);
+	e->flags = ACORN_CC_PRESENT;	/* clears any prior DELETED */
+	acorn_cc_write_end(e);
+
+	cc->slot->nelems++;			/* advisory; not budget-load-bearing */
+
+	LWLockRelease(&cc->slot->wlock);
+}
+
+void
+acorn_codecache_invalidate(Relation index,
+						   BlockNumber blkno, OffsetNumber offno)
+{
+	AcornCodeCacheScan *cc;
+	dsa_pointer *blocks;
+	dsa_pointer page_dp;
+	AcornCCPageHdr *ph;
+	AcornCodeCacheEntry *e;
+
+	cc = acorn_cc_writer_attach(index);
+	if (cc == NULL)
+		return;
+
+	LWLockAcquire(&cc->slot->wlock, LW_EXCLUSIVE);
+
+	/* resolve the page (no growth — a removed TID always predates growth) */
+	blocks = acorn_cc_resolve_blocks(cc, blkno);
+	if (blocks == NULL || !DsaPointerIsValid(blocks[blkno]))
+	{
+		LWLockRelease(&cc->slot->wlock);
+		return;
+	}
+	page_dp = blocks[blkno];
+	ph = (AcornCCPageHdr *) dsa_get_address(cc->area, page_dp);
+	if (offno < 1 || offno > ph->nslots)
+	{
+		LWLockRelease(&cc->slot->wlock);
+		return;
+	}
+	e = ACORN_CC_PAGE_ENTRY(ph, offno, cc->stride);
+
+	/*
+	 * Clear PRESENT and set DELETED under the seqlock.  A later insert that
+	 * reuses this (blkno,offno) overwrites the whole entry and re-sets
+	 * PRESENT (acorn_codecache_insert), so TID reuse can never serve the
+	 * stale code.
+	 */
+	acorn_cc_write_begin(e);
+	e->flags = (e->flags & ~ACORN_CC_PRESENT) | ACORN_CC_DELETED;
+	acorn_cc_write_end(e);
+
+	LWLockRelease(&cc->slot->wlock);
 }

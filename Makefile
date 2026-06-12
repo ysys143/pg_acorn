@@ -35,6 +35,7 @@ REGRESS = \
 	tier2_diversify \
 	tier2_inline_vectors \
 	tier2_code_cache \
+	tier2_code_cache_dml \
 	tier2_emission_order \
 	tier2_build_mwm \
 	tier2_build_parallel \
@@ -45,7 +46,7 @@ REGRESS = \
 
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
-ISOLATION      = concurrent_insert_scan concurrent_gamma_build
+ISOLATION      = concurrent_insert_scan concurrent_gamma_build concurrent_cache_insert_scan
 ISOLATION_OPTS = --inputdir=test --outputdir=test
 
 PG_CPPFLAGS = -I./src -Wno-unused-parameter
@@ -56,8 +57,8 @@ include $(PGXS)
 # Header dependency tracking (PGXS implicit rule does not track .h changes)
 src/pg_acorn.o:   src/acorn_hook.h src/acorn_am.h
 src/acorn_hook.o: src/acorn_hook.h src/acorn_scan.h
-src/acorn_am.o:   src/acorn_am.h   src/acorn_scan.h src/acorn_cost.h
-src/acorn_build.o: src/acorn_am.h   src/hnsw_compat.h src/acorn_t2_page.h src/pg_acorn.h src/acorn_dist.h src/acorn_scan.h
+src/acorn_am.o:   src/acorn_am.h   src/acorn_scan.h src/acorn_cost.h src/acorn_codecache.h
+src/acorn_build.o: src/acorn_am.h   src/hnsw_compat.h src/acorn_t2_page.h src/pg_acorn.h src/acorn_dist.h src/acorn_scan.h src/acorn_codecache.h
 src/acorn_scan.o:  src/acorn_scan.h src/hnsw_compat.h src/acorn_t2_page.h src/pg_acorn.h src/acorn_dist.h src/acorn_codecache.h
 src/acorn_cost.o:  src/acorn_cost.h src/acorn_am.h
 src/acorn_dist.o:  src/acorn_dist.h
