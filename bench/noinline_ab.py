@@ -14,6 +14,7 @@ Run inside the bench postgres container:
   python3 -u /workspace/bench/noinline_ab.py
 """
 
+import argparse
 import json
 import os
 import re
@@ -31,11 +32,13 @@ OUT = os.path.join(os.path.dirname(__file__), "results_noinline_ab.json")
 PASSES = 3
 SELS = [1, 10, 20]
 EFS = [100, 200, 400, 800, 1600]
-# (mode, index to keep, index to drop in-txn)
-MODES = [
-    ("inline", "tv_acorn_idx", "tv_acorn_noinline"),
-    ("noinline", "tv_acorn_noinline", "tv_acorn_idx"),
-]
+# mode -> (index to keep, index to drop in-txn)
+# "cache" = noinline index + pg_acorn.scan_code_cache=on (M1 read path)
+MODES = {
+    "inline": ("tv_acorn_idx", "tv_acorn_noinline"),
+    "noinline": ("tv_acorn_noinline", "tv_acorn_idx"),
+    "cache": ("tv_acorn_noinline", "tv_acorn_idx"),
+}
 
 
 def plan_text(cur, sel, q):
@@ -74,13 +77,22 @@ def measure(cur, queries, truth, sel):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--modes", default="inline,noinline",
+                    help="comma list from: " + ",".join(MODES))
+    ap.add_argument("--out", default=OUT)
+    args = ap.parse_args()
+    run_modes = [m.strip() for m in args.modes.split(",")]
+    assert all(m in MODES for m in run_modes), run_modes
+
     print("[fixture] regenerating (deterministic) ...", flush=True)
     vecs, buckets, queries = make_fixture()
     truths = {s: [exact_truth(vecs, buckets, q, s) for q in queries]
               for s in SELS}
 
     conn = psycopg.connect(DSN, autocommit=True, prepare_threshold=0)
-    out = {"meta": {"protocol": "FAIR-1T inline/noinline A/B, "
+    out = {"meta": {"protocol": "FAIR-1T A/B "
+                    f"modes={','.join(run_modes)}, "
                     f"passes={PASSES}, nq={len(queries)}",
                     "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                  time.gmtime())},
@@ -101,7 +113,10 @@ def main():
         cur.execute("SHOW pg_acorn.buffered_emission")
         assert cur.fetchone()[0] == "on"
 
-        for mode, keep, drop in MODES:
+        for mode in run_modes:
+            keep, drop = MODES[mode]
+            cur.execute("SET pg_acorn.scan_code_cache = "
+                        + ("on" if mode == "cache" else "off"))
             cur.execute("BEGIN")
             cur.execute(f"DROP INDEX {drop}")
             for sel in SELS:
@@ -125,15 +140,15 @@ def main():
                           f"p90={op['p90_ms']:.2f}ms "
                           f"min_mean={op['min_mean_ms']:.2f}ms "
                           f"buf={hit}+{read}", flush=True)
-                    with open(OUT, "w") as f:
+                    with open(args.out, "w") as f:
                         json.dump(out, f, indent=1)
             cur.execute("ROLLBACK")
 
     out["meta"]["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                 time.gmtime())
-    with open(OUT, "w") as f:
+    with open(args.out, "w") as f:
         json.dump(out, f, indent=1)
-    print(f"[done] -> {OUT}", flush=True)
+    print(f"[done] -> {args.out}", flush=True)
 
 
 if __name__ == "__main__":
