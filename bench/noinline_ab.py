@@ -80,10 +80,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--modes", default="inline,noinline",
                     help="comma list from: " + ",".join(MODES))
+    ap.add_argument("--efs", default=",".join(str(e) for e in EFS),
+                    help="comma list of ef_search values")
     ap.add_argument("--out", default=OUT)
     args = ap.parse_args()
     run_modes = [m.strip() for m in args.modes.split(",")]
     assert all(m in MODES for m in run_modes), run_modes
+    run_efs = [int(e) for e in args.efs.split(",")]
 
     print("[fixture] regenerating (deterministic) ...", flush=True)
     vecs, buckets, queries = make_fixture()
@@ -120,7 +123,7 @@ def main():
             cur.execute("BEGIN")
             cur.execute(f"DROP INDEX {drop}")
             for sel in SELS:
-                for ef in EFS:
+                for ef in run_efs:
                     cur.execute(f"SET pg_acorn.ef_search = {ef}")
                     plan = plan_text(cur, sel, queries[0])
                     assert (f"Index Scan using {keep}" in plan
