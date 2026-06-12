@@ -1,0 +1,67 @@
+Parsed test spec with 2 sessions
+
+starting permutation: begin_scan insert_rows run_scan end_scan
+step begin_scan: BEGIN;
+step insert_rows: 
+    INSERT INTO cc_items (bucket, embedding)
+    SELECT 1, ('[' || (0.9 + i*0.001)::text || ',0.0,0.0,0.0]')::vector
+    FROM generate_series(1, 40) i;
+
+step run_scan: 
+    SELECT count(*) FROM (
+        SELECT id FROM cc_items
+        WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]'
+        LIMIT 10
+    ) sub;
+
+count
+-----
+   10
+(1 row)
+
+step end_scan: COMMIT;
+
+starting permutation: insert_rows begin_scan run_scan end_scan
+step insert_rows: 
+    INSERT INTO cc_items (bucket, embedding)
+    SELECT 1, ('[' || (0.9 + i*0.001)::text || ',0.0,0.0,0.0]')::vector
+    FROM generate_series(1, 40) i;
+
+step begin_scan: BEGIN;
+step run_scan: 
+    SELECT count(*) FROM (
+        SELECT id FROM cc_items
+        WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]'
+        LIMIT 10
+    ) sub;
+
+count
+-----
+   10
+(1 row)
+
+step end_scan: COMMIT;
+
+starting permutation: begin_scan run_scan insert_rows end_scan
+step begin_scan: BEGIN;
+step run_scan: 
+    SELECT count(*) FROM (
+        SELECT id FROM cc_items
+        WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]'
+        LIMIT 10
+    ) sub;
+
+count
+-----
+   10
+(1 row)
+
+step insert_rows: 
+    INSERT INTO cc_items (bucket, embedding)
+    SELECT 1, ('[' || (0.9 + i*0.001)::text || ',0.0,0.0,0.0]')::vector
+    FROM generate_series(1, 40) i;
+
+step end_scan: COMMIT;

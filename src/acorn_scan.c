@@ -1733,28 +1733,27 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 		 */
 		if (s->cc)
 		{
-			const AcornCodeCacheEntry *e =
-				acorn_codecache_lookup(s->cc, nblkno, noffno);
+			AcornCodeCacheHit hit;
 
-			if (e != NULL)
+			if (acorn_codecache_lookup(s->cc, nblkno, noffno, &hit))
 			{
-				double	ad = acorn_t2_sq8_distance(s, e->code,
-												   e->scale, e->offset);
+				double	ad = acorn_t2_sq8_distance(s, hit.code,
+												   hit.scale, hit.offset);
 
 #ifdef ACORN_CC_DEBUG
 				s->dbg_cc_hits++;
 #endif
-				double	alb = acorn_t2_inline_lb(s, ad, e->scale);
-				bool	cpasses = (e->flags & ACORN_CC_DELETED) == 0 &&
-					acorn_t2_eval_filter(s->keys, s->nkeys, e->filter_val);
+				double	alb = acorn_t2_inline_lb(s, ad, hit.scale);
+				bool	cpasses = (hit.flags & ACORN_CC_DELETED) == 0 &&
+					acorn_t2_eval_filter(s->keys, s->nkeys, hit.filter_val);
 
 				cn = palloc(sizeof(AcornPQNode));
 				ItemPointerCopy(&neighbors[i], &cn->elem.indextid);
 				ItemPointerSetInvalid(&cn->elem.heaptid);
 				cn->elem.distance = ad;
 				cn->elem.lb       = alb;
-				ItemPointerCopy(&e->nbrtid, &cn->elem.nbrtid);
-				cn->elem.level   = e->level;
+				ItemPointerCopy(&hit.nbrtid, &cn->elem.nbrtid);
+				cn->elem.level   = hit.level;
 				cn->elem.has_nbr = true;
 				pairingheap_add((s->member_first && cpasses) ? s->Cm : s->C,
 								&cn->ph_node);
@@ -1764,7 +1763,7 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 					AcornPQNode *rn = palloc(sizeof(AcornPQNode));
 
 					ItemPointerCopy(&neighbors[i], &rn->elem.indextid);
-					ItemPointerCopy(&e->heaptid, &rn->elem.heaptid);
+					ItemPointerCopy(&hit.heaptid, &rn->elem.heaptid);
 					rn->elem.distance = ad;
 					rn->elem.lb       = alb;
 					rn->elem.has_nbr  = false;

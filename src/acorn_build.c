@@ -58,6 +58,7 @@
 #include "acorn_scan.h"
 #include "acorn_t2_page.h"
 #include "acorn_dist.h"
+#include "acorn_codecache.h"
 
 /*
  * Cap random levels so neighbor tuples remain page-sized.
@@ -3329,6 +3330,25 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 				}
 			}
 		}
+	}
+
+	/*
+	 * M2 cache upsert: on a NON-inline index, after the element + neighbor
+	 * tuples are durably written, push the new element's entry into the
+	 * shared-memory code cache so a warm cache serves it without an
+	 * element-page read.  No-op when no warm slot exists (e.g. during the
+	 * build of a brand-new relfilenumber, or when the GUC budget is 0):
+	 * the next scan loads a complete snapshot lazily, so nothing is lost.
+	 * Inline indexes never consult the cache, so skip them.
+	 */
+	if (!inline_on)
+	{
+		AcornPgVector *v = (AcornPgVector *) DatumGetPointer(value);
+		ItemPointerData nbr_tid;
+
+		ItemPointerSet(&nbr_tid, n_blk, n_off);
+		acorn_codecache_insert(index, e_blk, e_off, v->x, (int) v->dim,
+							   heaptid, &nbr_tid, (uint8) l_new, filter_val);
 	}
 
 	pfree(ntup);

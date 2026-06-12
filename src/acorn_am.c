@@ -30,6 +30,7 @@
 #include "acorn_cost.h"
 #include "acorn_scan.h"
 #include "acorn_t2_page.h"
+#include "acorn_codecache.h"
 
 PG_FUNCTION_INFO_V1(acorn_hnsw_handler);
 
@@ -314,6 +315,15 @@ acorn_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				etup->deleted  = 1;
 				page_modified  = true;
 				stats->tuples_removed++;
+
+				/*
+				 * M2 cache invalidation: clear this element's cache entry so a
+				 * later insert that reuses its (blkno,offno) cannot serve the
+				 * stale code.  No-op when no warm slot exists.  Done here under
+				 * the buffer's exclusive lock; the cache write takes only the
+				 * slot's own LWLock, never a buffer lock, so no lock inversion.
+				 */
+				acorn_codecache_invalidate(info->index, blkno, off);
 			}
 		}
 
