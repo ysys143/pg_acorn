@@ -114,6 +114,22 @@ bool acorn_scan_direct_filter = true;
  */
 bool acorn_scan_inline_vectors = true;
 
+/*
+ * GUC: Tier 2 scan toggle — serve neighbor discovery on NON-inline indexes
+ * from the per-index shared-memory SQ8 code cache (acorn_codecache.c).
+ * Default off (M1: read path only; flip after the design gates pass).
+ * Misses and disabled/LOADING slots fall back to the element-page read, so
+ * results never depend on cache state.
+ */
+bool acorn_scan_code_cache = false;
+
+/*
+ * GUC: total shared-memory budget for the SQ8 code cache, in MB.  0 disables
+ * the cache entirely.  A load that would exceed the budget stops and leaves
+ * the slot PARTIAL (present entries serve, misses fall back).
+ */
+int acorn_code_cache_size_mb = 512;
+
 void _PG_init(void);
 void _PG_fini(void);
 
@@ -316,6 +332,36 @@ _PG_init(void)
 		true,
 		PGC_USERSET,
 		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_code_cache */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_code_cache",
+		"Serve acorn_hnsw neighbor discovery on non-inline indexes from the "
+		"shared-memory SQ8 code cache.  Misses fall back to the classic "
+		"element-page read; inline-vector indexes never consult the cache.",
+		NULL,
+		&acorn_scan_code_cache,
+		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.code_cache_size */
+	DefineCustomIntVariable(
+		"pg_acorn.code_cache_size",
+		"Total shared-memory budget for the acorn_hnsw SQ8 code cache. "
+		"0 disables the cache; a load exceeding the budget stops and serves "
+		"partially (misses fall back to element-page reads).",
+		NULL,
+		&acorn_code_cache_size_mb,
+		512,		/* default 512 MB */
+		0,			/* min: 0 = disabled */
+		1048576,	/* max: 1 TB */
+		PGC_USERSET,
+		GUC_UNIT_MB,
 		NULL, NULL, NULL
 	);
 

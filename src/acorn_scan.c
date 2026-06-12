@@ -34,6 +34,7 @@
 #include "hnsw_compat.h"
 #include "acorn_t2_page.h"
 #include "acorn_dist.h"
+#include "acorn_codecache.h"
 
 /* -----------------------------------------------------------------------
  * Internal element reference
@@ -1020,6 +1021,17 @@ struct AcornT2StreamScan
 	double			q_l1;			/* L1 norm of the query (IP error bound) */
 	pairingheap	   *Rx;			/* exact-reranked results, awaiting emit */
 	int				rx_count;
+
+	/*
+	 * Shared-memory SQ8 code cache (acorn_codecache.c) — NON-inline indexes
+	 * only.  Discovery hits provide the same fields an inline entry does
+	 * (SQ8 code for approx ordering, filter_val, nbrtid/level, heaptid);
+	 * misses use the element-page read.  `approx` is true whenever discovery
+	 * distances can be SQ8 approximations (inline_on or cc), enabling the
+	 * lb-ordered R + exact re-rank emission machinery.
+	 */
+	AcornCodeCacheScan *cc;		/* NULL = cache not serving this scan */
+	bool			approx;		/* inline_on || cc != NULL */
 };
 
 /*
@@ -1206,19 +1218,21 @@ acorn_t2_eval_filter(ScanKey keys, int nkeys, int64 stored_val)
  * ----------------------------------------------------------------------- */
 
 /*
- * Approximate distance from a co-located SQ8 entry to the query.
+ * Approximate distance from SQ8 codes to the query.
  * Uses the direct asymmetric kernel when the opclass distance resolved to a
  * known function; otherwise dequantizes into a scratch vector and calls the
  * opclass support function through fmgr (correct for any opclass).
+ * Shared by the inline-entry path and the shared-memory code cache path.
  */
 static double
-acorn_t2_inline_distance(AcornT2StreamScan *s, const AcornT2InlineEntry *e)
+acorn_t2_sq8_distance(AcornT2StreamScan *s, const uint8 *code,
+					  float scale, float offset)
 {
 	if (s->sq8_direct)
 	{
 		AcornPgVector *q = (AcornPgVector *) DatumGetPointer(s->query);
 
-		return s->sq8_direct(s->inline_dim, e->code, e->scale, e->offset, q->x);
+		return s->sq8_direct(s->inline_dim, code, scale, offset, q->x);
 	}
 
 	if (s->dequant_scratch == NULL)
@@ -1231,11 +1245,18 @@ acorn_t2_inline_distance(AcornT2StreamScan *s, const AcornT2InlineEntry *e)
 		SET_VARSIZE(s->dequant_scratch, sz);
 		s->dequant_scratch->dim = (int16) s->inline_dim;
 	}
-	acorn_sq8_decode(s->inline_dim, e->code, e->scale, e->offset,
+	acorn_sq8_decode(s->inline_dim, code, scale, offset,
 					 s->dequant_scratch->x);
 	return DatumGetFloat8(FunctionCall2(&s->dist_proc,
 										PointerGetDatum(s->dequant_scratch),
 										s->query));
+}
+
+/* Approximate distance from a co-located SQ8 entry to the query. */
+static inline double
+acorn_t2_inline_distance(AcornT2StreamScan *s, const AcornT2InlineEntry *e)
+{
+	return acorn_t2_sq8_distance(s, e->code, e->scale, e->offset);
 }
 
 /*
@@ -1672,6 +1693,55 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 		nblkno = ItemPointerGetBlockNumber(&neighbors[i]);
 		noffno = ItemPointerGetOffsetNumber(&neighbors[i]);
 
+		/*
+		 * Shared-memory code cache hit: everything the element page would
+		 * provide comes from the cached entry instead — filter_val for the
+		 * predicate, SQ8 distance for (approximate) ordering, nbrtid/level
+		 * for expansion, heaptid for emission — exactly what the inline
+		 * path reads from its co-located entries.  Approx distances carry
+		 * an exact-distance lower bound; emission re-ranks exactly.
+		 * A miss (or no cache) takes the element-page read below (G4:
+		 * correctness never depends on cache state).
+		 */
+		if (s->cc)
+		{
+			const AcornCodeCacheEntry *e =
+				acorn_codecache_lookup(s->cc, nblkno, noffno);
+
+			if (e != NULL)
+			{
+				double	ad = acorn_t2_sq8_distance(s, e->code,
+												   e->scale, e->offset);
+				double	alb = acorn_t2_inline_lb(s, ad, e->scale);
+				bool	cpasses = (e->flags & ACORN_CC_DELETED) == 0 &&
+					acorn_t2_eval_filter(s->keys, s->nkeys, e->filter_val);
+
+				cn = palloc(sizeof(AcornPQNode));
+				ItemPointerCopy(&neighbors[i], &cn->elem.indextid);
+				ItemPointerSetInvalid(&cn->elem.heaptid);
+				cn->elem.distance = ad;
+				cn->elem.lb       = alb;
+				ItemPointerCopy(&e->nbrtid, &cn->elem.nbrtid);
+				cn->elem.level   = e->level;
+				cn->elem.has_nbr = true;
+				pairingheap_add((s->member_first && cpasses) ? s->Cm : s->C,
+								&cn->ph_node);
+
+				if (cpasses)
+				{
+					AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+
+					ItemPointerCopy(&neighbors[i], &rn->elem.indextid);
+					ItemPointerCopy(&e->heaptid, &rn->elem.heaptid);
+					rn->elem.distance = ad;
+					rn->elem.lb       = alb;
+					rn->elem.has_nbr  = false;
+					pairingheap_add(s->R, &rn->ph_node);
+				}
+				continue;
+			}
+		}
+
 		nd = acorn_t2_load_node(s, nblkno, noffno,
 								 &nheaptid, &ndeleted, &nfilter_val,
 								 &n_nbrtid, &n_level);
@@ -1768,7 +1838,22 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	s->inline_on = (meta_flags & ACORN_T2_META_INLINE_VECTORS) != 0
 		&& acorn_scan_inline_vectors
 		&& meta_dims > 0;
-	if (s->inline_on)
+
+	/*
+	 * Shared-memory SQ8 code cache — NON-inline indexes only (the meta flag,
+	 * not the GUC, decides: inline indexes carry their own co-located codes
+	 * and never consult the cache).  NULL whenever the cache cannot serve
+	 * (GUC off, budget 0, directory full, slot LOADING in another backend);
+	 * the scan then runs the classic element-page path unchanged.
+	 */
+	s->cc = NULL;
+	if ((meta_flags & ACORN_T2_META_INLINE_VECTORS) == 0
+		&& acorn_scan_code_cache
+		&& meta_dims > 0)
+		s->cc = acorn_codecache_begin_scan(index, meta_dims);
+
+	s->approx = s->inline_on || (s->cc != NULL);
+	if (s->approx)
 	{
 		AcornPgVector  *q  = (AcornPgVector *) DatumGetPointer(query);
 		AcornDistFn		fn = acorn_resolve_direct_dist(index);
@@ -1833,7 +1918,7 @@ acorn_t2_stream_begin(Relation index, Datum query,
 			ItemPointerSetInvalid(&cn->elem.heaptid);
 			cn->elem.distance = d;
 			cn->elem.lb       = d;
-			if (acorn_scan_single_read || s->inline_on)
+			if (acorn_scan_single_read || s->approx)
 			{
 				ItemPointerCopy(&nbrtid, &cn->elem.nbrtid);
 				cn->elem.level   = level;
@@ -1908,7 +1993,7 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 			: (AcornPQNode *) pairingheap_first(s->R);
 		double r_dist = rhead ? rhead->elem.distance : DBL_MAX;
 		double r_lb   = rhead ? rhead->elem.lb       : DBL_MAX;
-		double rx_dist = (s->inline_on && !pairingheap_is_empty(s->Rx))
+		double rx_dist = (s->approx && !pairingheap_is_empty(s->Rx))
 			? ((AcornPQNode *) pairingheap_first(s->Rx))->elem.distance
 			: DBL_MAX;
 		double r_bound = Min(r_dist, rx_dist);
@@ -1984,15 +2069,16 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 		}
 
 		/*
-		 * Inline mode: exact re-rank before emission.  R is ordered by the
-		 * exact-distance lower bound, so re-ranking while lb(R head) <=
-		 * exact(Rx head) provably moves every candidate that could still
-		 * beat the current exact head into Rx — emission order among
-		 * emitted results is then exact, with no quantization misses.  The
-		 * fixed lookahead window only matters for opclasses without a
-		 * usable error bound (fmgr dequant path, where lb == approx).
+		 * Approx mode (inline entries or code cache): exact re-rank before
+		 * emission.  R is ordered by the exact-distance lower bound, so
+		 * re-ranking while lb(R head) <= exact(Rx head) provably moves
+		 * every candidate that could still beat the current exact head
+		 * into Rx — emission order among emitted results is then exact,
+		 * with no quantization misses.  The fixed lookahead window only
+		 * matters for opclasses without a usable error bound (fmgr dequant
+		 * path, where lb == approx).
 		 */
-		if (s->inline_on)
+		if (s->approx)
 		{
 			bool	have_bound = (s->sq8_direct != NULL);
 

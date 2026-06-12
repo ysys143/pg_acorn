@@ -10,7 +10,8 @@ OBJS = \
 	src/acorn_build.o \
 	src/acorn_scan.o \
 	src/acorn_cost.o \
-	src/acorn_dist.o
+	src/acorn_dist.o \
+	src/acorn_codecache.o
 
 # Distance kernels must compile exactly like pgvector 0.8.0 (same flags ->
 # same auto-vectorized summation order -> bit-identical distances vs fmgr).
@@ -33,6 +34,7 @@ REGRESS = \
 	tier2_payload_edges \
 	tier2_diversify \
 	tier2_inline_vectors \
+	tier2_code_cache \
 	tier2_emission_order \
 	tier2_build_mwm \
 	tier2_build_parallel \
@@ -56,9 +58,10 @@ src/pg_acorn.o:   src/acorn_hook.h src/acorn_am.h
 src/acorn_hook.o: src/acorn_hook.h src/acorn_scan.h
 src/acorn_am.o:   src/acorn_am.h   src/acorn_scan.h src/acorn_cost.h
 src/acorn_build.o: src/acorn_am.h   src/hnsw_compat.h src/acorn_t2_page.h src/pg_acorn.h src/acorn_dist.h src/acorn_scan.h
-src/acorn_scan.o:  src/acorn_scan.h src/hnsw_compat.h src/acorn_t2_page.h src/pg_acorn.h src/acorn_dist.h
+src/acorn_scan.o:  src/acorn_scan.h src/hnsw_compat.h src/acorn_t2_page.h src/pg_acorn.h src/acorn_dist.h src/acorn_codecache.h
 src/acorn_cost.o:  src/acorn_cost.h src/acorn_am.h
 src/acorn_dist.o:  src/acorn_dist.h
+src/acorn_codecache.o: src/acorn_codecache.h src/hnsw_compat.h src/acorn_t2_page.h src/pg_acorn.h src/acorn_dist.h
 
 # Unit tests — standalone C binaries, no PostgreSQL dependency.
 # Tests cover algorithm logic extracted in test/unit/*.c (self-contained stubs).

@@ -25,4 +25,8 @@ extern bool acorn_scan_visited_oneprobe;
 extern bool acorn_scan_direct_filter;
 extern bool acorn_scan_inline_vectors;
 
+/* Shared-memory SQ8 code cache (acorn_codecache.c) */
+extern bool acorn_scan_code_cache;
+extern int  acorn_code_cache_size_mb;
+
 #endif /* PG_ACORN_H */
