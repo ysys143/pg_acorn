@@ -1,0 +1,174 @@
+-- tier2_code_cache_evict.sql — M3 memory management + observability.
+--
+-- Covers, with pg_acorn.scan_code_cache forced ON:
+--   (a) whole-slot LRU eviction under a small pg_acorn.code_cache_size: warm
+--       index A, warm index B (admission evicts the LRU), and assert A's
+--       results are still correct (it falls back to the element-page path,
+--       identical to the cache-off truth);
+--   (b) pg_acorn_code_cache_evict(regclass) removes a slot and the next scan
+--       reloads it with a bumped generation;
+--   (c) growth-then-reclaim: warm a slot, INSERT enough rows to force several
+--       block-array growths interleaved with scans, and assert total_bytes
+--       stays bounded (retired arrays are reclaimed) while results stay
+--       identical to the cache-off truth.
+--
+-- Determinism: setseed + build_seed + serial build + distinct random vectors
+-- (no distance ties) so the cache-on vs cache-off comparison is exact ordered
+-- id identity, not merely recall.  The admission projection over-estimates a
+-- table's footprint, so a 1MB budget holds ~one of these ~3500-row indexes;
+-- loading a second evicts the first — the LRU path we want to exercise.
+
+\set ON_ERROR_STOP on
+\set q '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'
+
+CREATE SCHEMA test_cc_evict;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+SET search_path = test_cc_evict, public;
+
+SELECT setseed(0.815);
+SET pg_acorn.build_seed = 815;
+SET max_parallel_maintenance_workers = 0;
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 400;
+
+CREATE TABLE a (id serial PRIMARY KEY, bucket int, embedding vector(8));
+CREATE TABLE b (id serial PRIMARY KEY, bucket int, embedding vector(8));
+INSERT INTO a (bucket, embedding) SELECT (i % 10),
+    ('[' || random() || ',' || random() || ',' || random() || ',' || random()
+        || ',' || random() || ',' || random() || ',' || random() || ',' || random()
+        || ']')::vector
+FROM generate_series(1, 3500) i;
+INSERT INTO b (bucket, embedding) SELECT (i % 10),
+    ('[' || random() || ',' || random() || ',' || random() || ',' || random()
+        || ',' || random() || ',' || random() || ',' || random() || ',' || random()
+        || ']')::vector
+FROM generate_series(1, 3500) i;
+CREATE INDEX a_idx ON a
+    USING acorn_hnsw (embedding vector_l2_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2);
+CREATE INDEX b_idx ON b
+    USING acorn_hnsw (embedding vector_l2_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2);
+
+-- top-5 filtered ids for a table at the session's cache setting.
+CREATE FUNCTION topk(tbl regclass, cache bool) RETURNS int[] AS $$
+DECLARE r int[];
+BEGIN
+    EXECUTE format('SET pg_acorn.scan_code_cache = %s', cache);
+    SET enable_seqscan = off;
+    SET pg_acorn.ef_search = 400;
+    EXECUTE format(
+        'SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM %s WHERE bucket < 3 '
+        'ORDER BY embedding <-> ''[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]''::vector '
+        'LIMIT 5) s', tbl) INTO r;
+    RESET enable_seqscan;
+    RESET pg_acorn.scan_code_cache;
+    RETURN r;
+END;
+$$ LANGUAGE plpgsql;
+
+-- The exact (cache-off) truth for each table, captured once.
+CREATE TABLE truth_a AS SELECT topk('a', false) AS ids;
+CREATE TABLE truth_b AS SELECT topk('b', false) AS ids;
+
+------------------------------------------------------------------------
+-- (a) whole-slot LRU eviction under a tight budget.
+------------------------------------------------------------------------
+SET pg_acorn.code_cache_size = 1;     -- 1MB: holds ~one of these indexes
+
+-- Warm A: it becomes the sole resident slot.
+SELECT topk('a', true) = (SELECT ids FROM truth_a) AS a_warm_correct;
+SELECT count(*) = 1 AS one_slot_after_a FROM pg_acorn_code_cache_stats();
+SELECT indexrelid = 'a_idx'::regclass AS a_is_resident
+FROM pg_acorn_code_cache_stats();
+
+-- Warm B: admission must evict the LRU (A) to make room.
+SELECT topk('b', true) = (SELECT ids FROM truth_b) AS b_warm_correct;
+SELECT count(*) = 1 AS one_slot_after_b FROM pg_acorn_code_cache_stats();
+SELECT indexrelid = 'b_idx'::regclass AS b_is_resident
+FROM pg_acorn_code_cache_stats();
+
+-- A was evicted: its scan now falls back to the element page, still exact.
+SELECT topk('a', true) = (SELECT ids FROM truth_a) AS a_correct_after_evict;
+
+RESET pg_acorn.code_cache_size;       -- back to the default 512MB budget
+
+------------------------------------------------------------------------
+-- (b) explicit evict + reload bumps the generation.
+------------------------------------------------------------------------
+-- Warm A fresh under the default budget, capture its generation.
+SELECT topk('a', true) = (SELECT ids FROM truth_a) AS a_rewarm_correct;
+CREATE TABLE gen0 AS
+    SELECT generation FROM pg_acorn_code_cache_stats()
+    WHERE indexrelid = 'a_idx'::regclass;
+
+-- Force-evict A: present -> true.
+SELECT pg_acorn_code_cache_evict('a_idx') AS evicted_present;
+SELECT NOT EXISTS (SELECT 1 FROM pg_acorn_code_cache_stats()
+                   WHERE indexrelid = 'a_idx'::regclass) AS a_gone_after_evict;
+-- Evicting an absent slot returns false.
+SELECT pg_acorn_code_cache_evict('a_idx') AS evict_absent_false;
+
+-- Next scan reloads A; generation must have advanced.
+SELECT topk('a', true) = (SELECT ids FROM truth_a) AS a_reload_correct;
+SELECT (SELECT generation FROM pg_acorn_code_cache_stats()
+        WHERE indexrelid = 'a_idx'::regclass) > (SELECT generation FROM gen0)
+    AS generation_bumped;
+
+------------------------------------------------------------------------
+-- (c) growth-then-reclaim soak: inserts force block-array growths; total
+--     bytes must stay bounded (retired arrays reclaimed) and results exact.
+------------------------------------------------------------------------
+CREATE TABLE c (id serial PRIMARY KEY, bucket int, embedding vector(8));
+INSERT INTO c (bucket, embedding) SELECT (i % 10),
+    ('[' || random() || ',' || random() || ',' || random() || ',' || random()
+        || ',' || random() || ',' || random() || ',' || random() || ',' || random()
+        || ']')::vector
+FROM generate_series(1, 400) i;
+CREATE INDEX c_idx ON c
+    USING acorn_hnsw (embedding vector_l2_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2);
+
+-- Warm C.
+SELECT topk('c', true) IS NOT NULL AS c_warmed;
+CREATE TABLE c_bytes0 AS
+    SELECT bytes FROM pg_acorn_code_cache_stats()
+    WHERE indexrelid = 'c_idx'::regclass;
+
+-- Soak: interleave inserts (forcing directory/page-array growth) with scans.
+-- After each round the prior round's retired arrays are reclaimed at the next
+-- begin_scan-quiescent point, so bytes track live content, not cumulative
+-- growth.
+DO $$
+DECLARE k int;
+BEGIN
+    FOR k IN 1..6 LOOP
+        INSERT INTO c (bucket, embedding) SELECT (g % 10),
+            ('[' || random() || ',' || random() || ',' || random() || ',' || random()
+                || ',' || random() || ',' || random() || ',' || random() || ',' || random()
+                || ']')::vector
+        FROM generate_series(1, 200) g;
+        PERFORM topk('c', true);
+    END LOOP;
+END $$;
+
+-- Results still exact after the soak (cache-on == cache-off).
+SELECT topk('c', true) = topk('c', false) AS c_identical_after_soak;
+
+-- Reclaim happened: every superseded growth array was freed, so no retired
+-- arrays are pending.  (A leak would accumulate them.)
+SELECT blocks_retired_pending = 0 AS c_no_retired_pending
+FROM pg_acorn_code_cache_stats() WHERE indexrelid = 'c_idx'::regclass;
+
+-- Bytes track the LIVE element count, not cumulative growth.  Live bytes
+-- per element must stay near the entry stride plus the per-page/dir overhead
+-- (a few hundred bytes); a soak that leaked every superseded array would push
+-- bytes/nelems far above that.  256 B/elem is a generous ceiling for the
+-- dim=8 stride (~48 B) plus headroom — orders of magnitude below a leak.
+SELECT (SELECT bytes FROM pg_acorn_code_cache_stats()
+        WHERE indexrelid = 'c_idx'::regclass)
+       < (SELECT nelems FROM pg_acorn_code_cache_stats()
+          WHERE indexrelid = 'c_idx'::regclass) * 256 AS c_bytes_bounded;
+
+DROP SCHEMA test_cc_evict CASCADE;

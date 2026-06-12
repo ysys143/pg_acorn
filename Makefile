@@ -36,6 +36,7 @@ REGRESS = \
 	tier2_inline_vectors \
 	tier2_code_cache \
 	tier2_code_cache_dml \
+	tier2_code_cache_evict \
 	tier2_emission_order \
 	tier2_build_mwm \
 	tier2_build_parallel \
@@ -46,7 +47,7 @@ REGRESS = \
 
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
-ISOLATION      = concurrent_insert_scan concurrent_gamma_build concurrent_cache_insert_scan
+ISOLATION      = concurrent_insert_scan concurrent_gamma_build concurrent_cache_insert_scan concurrent_cache_evict_scan
 ISOLATION_OPTS = --inputdir=test --outputdir=test
 
 PG_CPPFLAGS = -I./src -Wno-unused-parameter

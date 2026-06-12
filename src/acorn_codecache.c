@@ -115,6 +115,13 @@ typedef struct AcornCCPageHdr
 #define ACORN_CC_DIR_GROW(need)		((need) + 64)
 
 /*
+ * Per-element overhead charged in the admission projection: amortized page
+ * header + page-array growth headroom.  Only used to over-estimate a table's
+ * footprint for LRU admission; the resident accounting (slot->bytes) is exact.
+ */
+#define ACORN_CC_PER_ELEM_OVERHEAD	8
+
+/*
  * Retired-array list: each block-directory or page array superseded by a
  * growth is pushed here (still reachable by readers that snapshotted the old
  * pointer) and freed only once the slot has no active scan — the grace
@@ -185,6 +192,8 @@ struct AcornCodeCacheScan
 {
 	dsa_area	   *area;
 	AcornCodeCacheSlot *slot;		/* live slot (for growth-aware lookup) */
+	Oid				dboid;			/* identity this attach was resolved for */
+	RelFileNumber	relnumber;
 	dsa_pointer		blocks_dp;		/* snapshot of slot->blocks at attach */
 	dsa_pointer    *blocks;			/* mapped block directory snapshot */
 	uint32			nblocks;		/* snapshot of slot->nblocks at attach */
@@ -301,13 +310,18 @@ acorn_cc_retire(AcornCodeCacheDirectory *dir, dsa_area *area,
 	if (DsaPointerIsValid(dp))
 	{
 		/*
-		 * Pair with the reader's active_scans++ ; barrier ; read blocks.  We
-		 * have already swapped slot->blocks (in the caller) before this; the
-		 * read barrier orders the active_scans load after that swap so a
-		 * reader whose increment is invisible here is guaranteed to read the
-		 * NEW array.
+		 * StoreLoad fence: the caller already swapped slot->blocks (a store);
+		 * we are about to load slot->active_scans.  This must be a FULL
+		 * barrier, not a read (acquire) barrier — it pairs with the reader's
+		 * "active_scans++ ; pg_memory_barrier() ; read slot->blocks" in
+		 * acorn_cc_scan_acquire.  With both full fences, a reader whose
+		 * increment is NOT visible to our load here is guaranteed to perform
+		 * its slot->blocks load AFTER our swap, so it reads the NEW array,
+		 * never `dp`.  A pg_read_barrier() would not order the prior store
+		 * before this load and the reader could observe the old array while
+		 * we free it.
 		 */
-		pg_read_barrier();
+		pg_memory_barrier();
 		if (pg_atomic_read_u32(&slot->active_scans) == 0)
 			dsa_free(area, dp);			/* no reader can hold it: free now */
 		else if (slot->n_retired < ACORN_CC_RETIRE_MAX)
@@ -332,7 +346,14 @@ acorn_cc_drain_retired(dsa_area *area, AcornCodeCacheSlot *slot)
 	if (slot->n_retired == 0)
 		return;
 
-	pg_read_barrier();
+	/*
+	 * Full StoreLoad fence: the retired arrays were superseded by an earlier
+	 * slot->blocks swap (store); we now load active_scans.  As in
+	 * acorn_cc_retire, this must be a full barrier so a reader whose
+	 * active_scans++ is invisible here is guaranteed to have read the new
+	 * blocks pointer (post-swap), never a retired array.
+	 */
+	pg_memory_barrier();
 	if (pg_atomic_read_u32(&slot->active_scans) != 0)
 		return;					/* a reader may still hold a retired pointer */
 
@@ -378,8 +399,22 @@ acorn_cc_forget_attach(Oid dboid, RelFileNumber relnumber)
 }
 
 /*
- * Evict one slot.  Caller holds dir->lock EXCLUSIVE and has verified the
- * slot is READY/PARTIAL with active_scans == 0.  Returns the bytes freed.
+ * Evict one slot.  Caller holds dir->lock EXCLUSIVE.  Returns the bytes freed.
+ *
+ * Ordering (the evictor half of the BUG-2 hazard discipline): mark the slot
+ * EMPTY and bump generation FIRST, then a full StoreLoad barrier, then read
+ * active_scans.  This pairs with acorn_cc_scan_acquire's "active_scans++ ;
+ * barrier ; reload state/generation":
+ *   - If a racing reader's increment is visible here (active_scans > 0), we
+ *     do NOT release the DSA area's creator pin — that reader may already
+ *     hold the area pointer.  The slot is still left EMPTY (it will reload
+ *     into a fresh area), and the old area's creator pin lingers until the
+ *     postmaster recycles the segment.  A bounded, rare leak (the racing
+ *     window is increment-then-reload), never a use-after-free.
+ *   - If active_scans == 0 here, every reader either has not yet incremented
+ *     (it will then observe EMPTY/gen++ after its own barrier and back out)
+ *     or has already left.  No live reader holds a pointer into this area:
+ *     dropping the creator pin and detaching is safe.
  */
 static uint64
 acorn_cc_evict_slot(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot)
@@ -393,7 +428,7 @@ acorn_cc_evict_slot(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot)
 	/*
 	 * Mark EMPTY first (under dir->lock) so no new begin_scan can attach to
 	 * the area we are about to release; bump generation so a backend holding
-	 * a stale attach detaches on its next begin_scan.
+	 * a stale attach (or mid-acquire) detaches / backs out.
 	 */
 	pg_atomic_write_u32(&slot->state, ACORN_CC_STATE_EMPTY);
 	slot->generation++;
@@ -409,13 +444,25 @@ acorn_cc_evict_slot(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot)
 	pg_atomic_write_u64(&slot->blocks, InvalidDsaPointer);
 	pg_atomic_fetch_sub_u64(&dir->total_bytes, freed);
 
+	/* StoreLoad fence: publish EMPTY/gen++ before reading active_scans */
+	pg_memory_barrier();
+	if (pg_atomic_read_u32(&slot->active_scans) != 0)
+	{
+		/*
+		 * A reader incremented in the race window.  It will see EMPTY/gen++
+		 * and back out, but it may already hold the area pointer — do not
+		 * free.  Forget only our own mapping; leave the creator pin.
+		 */
+		acorn_cc_forget_attach(dboid, relnumber);
+		return freed;
+	}
+
 	/*
-	 * Drop the creator pin so the segment can be reclaimed.  Prefer this
-	 * backend's existing mapping (a backend cannot dsa_attach the same
-	 * segment twice); only attach a fresh handle if we have none.  The
+	 * Quiescent: drop the creator pin so the segment can be reclaimed.
+	 * Prefer this backend's existing mapping (a backend cannot dsa_attach the
+	 * same segment twice); only attach a fresh handle if we have none.  The
 	 * memory frees when the last backend that mapped it detaches (others do
-	 * so at their next begin_scan generation check).  active_scans == 0
-	 * guarantees no reader is mid-dereference of this area right now.
+	 * so at their next begin_scan generation check).
 	 */
 	{
 		AcornCCAttachEntry *att = NULL;
@@ -586,6 +633,8 @@ acorn_cc_attach_store(Oid dboid, RelFileNumber relnumber,
 		hash_search(acorn_cc_attached, &key, HASH_ENTER, &found);
 	e->scan.area = area;
 	e->scan.slot = slot;
+	e->scan.dboid = dboid;
+	e->scan.relnumber = relnumber;
 	e->scan.blocks_dp = blocks_dp;
 	e->scan.blocks = blocks;
 	e->scan.nblocks = nblocks;
@@ -675,14 +724,28 @@ acorn_cc_load(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 	/*
 	 * Whole-index LRU admission: before loading, evict least-recently-used
 	 * READY/PARTIAL slots until this table's projected footprint fits beside
-	 * the resident ones.  The projection is the index's on-disk byte size — a
-	 * safe over-estimate of the cache table (TID-only pages are smaller than
-	 * the per-element entry, but the page-granular allocation + headroom keep
-	 * the cache table near the index size, and over-estimating only evicts
-	 * slightly more eagerly).  If nothing is evictable the load proceeds and
-	 * stops at PARTIAL when it actually hits the cap.
+	 * the resident ones (whose bytes are tracked exactly in dir->total_bytes).
+	 *
+	 * The projection must be on the SAME scale as total_bytes (actual cache
+	 * bytes), not the index's on-disk size — element tuples (80B header +
+	 * vector) pack only a handful per page, so the cache table is a fraction
+	 * of the index.  We bound the element count by nblocks * the max element
+	 * tuples that fit on a page, then multiply by the per-entry stride plus
+	 * the directory/page-header overhead.  This over-estimates (it assumes
+	 * every page is packed with the smallest possible element tuple), so
+	 * admission evicts slightly eagerly — never under-reserves.  If nothing
+	 * is evictable the load proceeds and stops at PARTIAL at the real cap.
 	 */
-	projected = (uint64) nblocks * BLCKSZ;
+	{
+		Size		min_etup = MAXALIGN(sizeof(AcornT2ElementTupleData) +
+										offsetof(AcornPgVector, x) +
+										(Size) dim * sizeof(float));
+		uint64		max_elems = (uint64) nblocks *
+			(BLCKSZ / Max(min_etup, 1));
+
+		projected = max_elems * (stride + ACORN_CC_PER_ELEM_OVERHEAD) +
+			(uint64) ACORN_CC_DIR_GROW(nblocks) * sizeof(dsa_pointer);
+	}
 	if (projected < budget)
 	{
 		LWLockAcquire(&dir->lock, LW_EXCLUSIVE);
@@ -849,25 +912,53 @@ acorn_cc_load(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
  * ----------------------------------------------------------------------- */
 
 /*
- * Acquire an active-scan reference: increment active_scans, refresh the
- * block snapshot from the live slot, and stamp lastused for LRU.  The
- * increment is published BEFORE the snapshot read (a full barrier between),
- * which is what makes the retire/reclaim grace period sound: a reader that
- * could observe a soon-to-be-retired array is counted before the grower
- * checks active_scans.
+ * Acquire an active-scan reference and confirm the slot is still live.
+ *
+ * Hazard-pointer discipline (the BUG-2 fix): publish the refcount FIRST, full
+ * barrier, THEN revalidate the slot.  `expect_gen` is the generation observed
+ * when this backend attached / validated the slot; if eviction has bumped it
+ * (or flipped the slot away from READY/PARTIAL, or re-keyed it to another
+ * index) the ref we just took is on a dead slot — we back it out and fail.
+ *
+ * This is what makes eviction's "active_scans == 0 => safe to free" sound:
+ * the evictor sets state=EMPTY / gen++ BEFORE its own full barrier and read of
+ * active_scans.  Either our increment is visible to the evictor (it sees
+ * active_scans > 0 and does not free), OR our post-increment reload here sees
+ * the EMPTY/gen bump and we back out before dereferencing slot->blocks.  No
+ * reader that proceeds can hold a pointer into a freed area.
+ *
+ * Returns true if the ref is held and the slot is live; false if backed out.
  */
-static void
-acorn_cc_scan_acquire(AcornCodeCacheDirectory *dir, AcornCodeCacheScan *cc)
+static bool
+acorn_cc_scan_acquire(AcornCodeCacheDirectory *dir, AcornCodeCacheScan *cc,
+					  uint32 expect_gen)
 {
-	pg_atomic_fetch_add_u32(&cc->slot->active_scans, 1);
-	pg_memory_barrier();
-	cc->scan_active = true;
-	pg_atomic_write_u64(&cc->slot->lastused, acorn_cc_tick(dir));
+	AcornCodeCacheSlot *slot = cc->slot;
+	uint32		st;
 
-	/* refresh snapshot AFTER the ref is visible (orders with the swap) */
-	cc->blocks_dp = (dsa_pointer) pg_atomic_read_u64(&cc->slot->blocks);
-	cc->nblocks = pg_atomic_read_u32(&cc->slot->nblocks);
+	pg_atomic_fetch_add_u32(&slot->active_scans, 1);
+	pg_memory_barrier();		/* publish ref before revalidating (and before
+								 * reading slot->blocks) */
+
+	st = pg_atomic_read_u32(&slot->state);
+	if (slot->generation != expect_gen ||
+		(st != ACORN_CC_STATE_READY && st != ACORN_CC_STATE_PARTIAL) ||
+		cc->dboid != slot->dboid || cc->relnumber != slot->relnumber)
+	{
+		/* slot died under us (evicted/reloaded): drop the ref, fail */
+		pg_atomic_fetch_sub_u32(&slot->active_scans, 1);
+		cc->scan_active = false;
+		return false;
+	}
+
+	cc->scan_active = true;
+	pg_atomic_write_u64(&slot->lastused, acorn_cc_tick(dir));
+
+	/* refresh snapshot AFTER the ref is visible and the slot is confirmed live */
+	cc->blocks_dp = (dsa_pointer) pg_atomic_read_u64(&slot->blocks);
+	cc->nblocks = pg_atomic_read_u32(&slot->nblocks);
 	cc->blocks = (dsa_pointer *) dsa_get_address(cc->area, cc->blocks_dp);
+	return true;
 }
 
 AcornCodeCacheScan *
@@ -903,11 +994,21 @@ acorn_codecache_begin_scan(Relation index, int dim)
 			s->dboid == dboid && s->relnumber == relnumber &&
 			(st == ACORN_CC_STATE_READY || st == ACORN_CC_STATE_PARTIAL))
 		{
-			acorn_cc_scan_acquire(dir, &att->scan);
-			return &att->scan;
+			/*
+			 * Provisional pass; scan_acquire publishes the ref then RE-checks
+			 * generation/state (BUG-2 hazard discipline).  On a back-out the
+			 * slot was evicted between here and the increment: forget the
+			 * stale mapping and fall through to a fresh resolve.
+			 */
+			if (acorn_cc_scan_acquire(dir, &att->scan, att->scan.generation))
+				return &att->scan;
+			acorn_cc_forget_attach(dboid, relnumber);
 		}
-		/* stale: drop the mapping and fall through to a fresh resolve */
-		acorn_cc_forget_attach(dboid, relnumber);
+		else
+		{
+			/* stale: drop the mapping and fall through to a fresh resolve */
+			acorn_cc_forget_attach(dboid, relnumber);
+		}
 	}
 
 	slot = acorn_cc_slot_lookup(dir, dboid, relnumber);
@@ -935,7 +1036,13 @@ acorn_codecache_begin_scan(Relation index, int dim)
 		return NULL;			/* defensive: stale slot from a prior life */
 
 	cc = acorn_cc_attach(dir, slot, dboid, relnumber);
-	acorn_cc_scan_acquire(dir, cc);
+	/*
+	 * cc->generation was captured inside acorn_cc_attach (under dir->lock).
+	 * If eviction bumps it before our ref is published, scan_acquire backs
+	 * out and we fall back to the element-page path for this scan (G4).
+	 */
+	if (!acorn_cc_scan_acquire(dir, cc, cc->generation))
+		return NULL;
 	return cc;
 }
 
