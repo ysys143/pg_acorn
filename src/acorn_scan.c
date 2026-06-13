@@ -37,6 +37,49 @@
 #include "acorn_codecache.h"
 
 /* -----------------------------------------------------------------------
+ * Code-cache read pipelining
+ *
+ * The shared-memory code table (~40 MB at 250K/dim=128) overflows CPU cache,
+ * so each per-neighbor entry read is a cold DRAM miss — the measured penalty
+ * vs the inline layout, whose codes are co-located in an already-pinned page.
+ * We hide that latency by software-prefetching neighbor (i+K)'s resolved
+ * entry while neighbor i's already-prefetched entry is read+scored.  Prefetch
+ * is a pure hint: a prefetched address that turns out invalid/evicted just
+ * wastes the hint; acorn_codecache_read still performs every G4 safety check.
+ *
+ * K is the pipeline depth: how many neighbors ahead to prefetch.  At dim=128
+ * the entry spans ~3 cache lines after the 40-byte header; K in [4,8] covers
+ * a DRAM miss (~80-100 ns) behind one SQ8 distance compute (~few hundred ns).
+ */
+#define ACORN_CC_PREFETCH_AHEAD	6
+
+#if defined(__GNUC__) || defined(__clang__)
+#define ACORN_PREFETCH_R(addr)	__builtin_prefetch((addr), 0, 3)
+#else
+#define ACORN_PREFETCH_R(addr)	((void) (addr))
+#endif
+
+/*
+ * Prefetch a resolved code-cache entry into L1 for an imminent read: the
+ * entry header (version/heaptid/.../scale/offset, 40 B) plus the SQ8 code
+ * (dim bytes spanning ~3 lines at dim=128).  NULL-safe; touches at most
+ * 1 (header) + 4 (up to 256 code bytes) cache lines.  A read hint only.
+ */
+static inline void
+acorn_cc_prefetch_entry(const AcornCodeCacheEntry *e, int dim)
+{
+	const char *p;
+	int			off;
+
+	if (e == NULL)
+		return;
+	ACORN_PREFETCH_R(e);					/* header + first code bytes */
+	p = (const char *) e->code;
+	for (off = 64; off < dim; off += 64)	/* remaining code cache lines */
+		ACORN_PREFETCH_R(p + off);
+}
+
+/* -----------------------------------------------------------------------
  * Internal element reference
  * ----------------------------------------------------------------------- */
 
@@ -1622,6 +1665,8 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 	BlockNumber		nbr_blkno;
 	OffsetNumber	nbr_offno;
 	int				n_count;
+	/* code-cache read pipeline: resolved entries prefetched K ahead of use */
+	const AcornCodeCacheEntry *pf_entry[HNSW_MAX_NEIGHBORS];
 
 	if (ce->has_nbr)
 	{
@@ -1685,6 +1730,35 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 		}
 	}
 
+	/*
+	 * Code-cache read pipeline (see acorn_cc_prefetch_entry).  pf_entry[j]
+	 * holds neighbor j's resolved cache entry pointer, pre-prefetched K
+	 * iterations before it is read+scored so its DRAM line is warm by then.
+	 * Resolving is cheap (two dependent loads, no lock); the heavy read
+	 * (seqlock copy of the cold code) happens only at the consume site.
+	 * Pre-resolution is a hint with no semantic effect: a visited/skipped
+	 * neighbor just wastes its prefetch, and the consume site still does the
+	 * full resolve-if-needed + version-checked read + G4 fallback.  Only the
+	 * leading edge needs priming; the rolling prefetch inside the loop covers
+	 * the rest.
+	 */
+	if (s->cc)
+	{
+		int		prime = Min(ACORN_CC_PREFETCH_AHEAD, n_count);
+
+		for (int j = 0; j < n_count; j++)
+			pf_entry[j] = NULL;
+		for (int j = 0; j < prime; j++)
+		{
+			if (!ItemPointerIsValid(&neighbors[j]))
+				continue;
+			pf_entry[j] = acorn_codecache_resolve(s->cc,
+								ItemPointerGetBlockNumber(&neighbors[j]),
+								ItemPointerGetOffsetNumber(&neighbors[j]));
+			acorn_cc_prefetch_entry(pf_entry[j], s->inline_dim);
+		}
+	}
+
 	for (int i = 0; i < n_count; i++)
 	{
 		BlockNumber		nblkno;
@@ -1700,6 +1774,25 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 #ifdef ACORN_CC_DEBUG
 		s->dbg_neigh_iters++;
 #endif
+		/*
+		 * Rolling prefetch: resolve + prefetch neighbor i+K's entry now so it
+		 * is warm when we reach it.  Done before the visited check so the
+		 * pipeline depth stays constant regardless of which neighbors get
+		 * skipped (a skipped neighbor's prefetch is simply unused).
+		 */
+		if (s->cc)
+		{
+			int		pf = i + ACORN_CC_PREFETCH_AHEAD;
+
+			if (pf < n_count && ItemPointerIsValid(&neighbors[pf]))
+			{
+				pf_entry[pf] = acorn_codecache_resolve(s->cc,
+									ItemPointerGetBlockNumber(&neighbors[pf]),
+									ItemPointerGetOffsetNumber(&neighbors[pf]));
+				acorn_cc_prefetch_entry(pf_entry[pf], s->inline_dim);
+			}
+		}
+
 		if (!ItemPointerIsValid(&neighbors[i]))
 			continue;
 		if (acorn_scan_visited_oneprobe)
@@ -1730,12 +1823,22 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 		 * an exact-distance lower bound; emission re-ranks exactly.
 		 * A miss (or no cache) takes the element-page read below (G4:
 		 * correctness never depends on cache state).
+		 *
+		 * The entry was resolved + prefetched K iterations earlier, so the
+		 * read here finds its code line already warm.  If pre-resolution
+		 * returned NULL (TID not yet cached at prefetch time, or a growth
+		 * refresh moved the snapshot), re-resolve inline — the result is
+		 * identical, just without the prefetch head start.
 		 */
 		if (s->cc)
 		{
 			AcornCodeCacheHit hit;
+			const AcornCodeCacheEntry *e = pf_entry[i];
 
-			if (acorn_codecache_lookup(s->cc, nblkno, noffno, &hit))
+			if (e == NULL)
+				e = acorn_codecache_resolve(s->cc, nblkno, noffno);
+
+			if (acorn_codecache_read(s->cc, e, &hit))
 			{
 				double	ad = acorn_t2_sq8_distance(s, hit.code,
 												   hit.scale, hit.offset);

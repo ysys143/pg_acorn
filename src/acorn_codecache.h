@@ -97,10 +97,46 @@ extern AcornCodeCacheScan *acorn_codecache_begin_scan(Relation index, int dim);
  * Look up one element by its index TID, copying a stable snapshot into *out.
  * Returns true on a present hit, false on miss / not-present / torn read
  * (caller falls back to the element-page read).
+ *
+ * This is the one-shot form (resolve + read); the scan's hot loop instead
+ * software-pipelines the two halves via acorn_codecache_resolve /
+ * acorn_codecache_read so the entry's DRAM line is prefetched ahead of the
+ * read (the ~40 MB code table overflows CPU cache, so each entry read is a
+ * cold miss otherwise).
  */
 extern bool acorn_codecache_lookup(AcornCodeCacheScan *cc,
 								   BlockNumber blkno, OffsetNumber offno,
 								   AcornCodeCacheHit *out);
+
+/*
+ * Resolve one element's cache entry to a stable in-DSA pointer WITHOUT
+ * copying it out.  This is the cheap half of a lookup: directory snapshot
+ * refresh + page-array dereference + offno bound check.  Returns the entry
+ * pointer (suitable for __builtin_prefetch), or NULL when the cache cannot
+ * serve this (blkno,offno) — directory miss, no page array, out-of-range
+ * offno, or a reincarnation guard trip.  The returned pointer is valid for
+ * the rest of the scan: the area is pinned by the active-scan ref and any
+ * growth only moves FORWARD to a newer array (resolve re-snapshots), so a
+ * resolved pointer never dangles into freed memory while the scan runs.
+ *
+ * No seqlock copy-out happens here, so the pointer alone proves nothing about
+ * the entry's contents; acorn_codecache_read performs the version-checked copy
+ * and all the G4 safety checks.  A prefetch of a pointer that later turns out
+ * evicted/torn simply wastes a prefetch — the read still falls back correctly.
+ */
+extern const AcornCodeCacheEntry *acorn_codecache_resolve(AcornCodeCacheScan *cc,
+														  BlockNumber blkno,
+														  OffsetNumber offno);
+
+/*
+ * Copy a resolved entry out under its seqlock into *out.  `e` must come from
+ * acorn_codecache_resolve on the same scan.  Returns true on a present, stable
+ * hit (sets *out); false on not-present / torn read / NULL entry, in which
+ * case the caller falls back to the element-page read (G4).
+ */
+extern bool acorn_codecache_read(AcornCodeCacheScan *cc,
+								 const AcornCodeCacheEntry *e,
+								 AcornCodeCacheHit *out);
 
 /*
  * Release the active-scan reference taken by begin_scan (M3).  The AM must

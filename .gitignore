@@ -20,6 +20,7 @@ bench/fixtures/data/
 # PostgreSQL extension build artifacts
 *.o
 *.bc
+*.bc.tmp
 *.so
 test/results/
 test/regression.out
