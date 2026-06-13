@@ -1,0 +1,277 @@
+{
+ "meta": {
+  "protocol": "FAIR-1T A/B modes=inline,cache, passes=3, nq=40",
+  "started_utc": "2026-06-13T14:17:56Z",
+  "finished_utc": "2026-06-13T14:24:52Z"
+ },
+ "index_size": {
+  "tv_acorn_idx": 4253548544,
+  "tv_acorn_noinline": 260718592
+ },
+ "ops": [
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 1,
+   "ef": 100,
+   "recall": 0.9775,
+   "med_ms": 2.6326755178160965,
+   "p90_ms": 42.07213580375546,
+   "min_mean_ms": 2.375019565806724,
+   "buf_hit": 386,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 1,
+   "ef": 200,
+   "recall": 1.0,
+   "med_ms": 3.6141059827059507,
+   "p90_ms": 44.35669217491524,
+   "min_mean_ms": 3.113016748102382,
+   "buf_hit": 586,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 1,
+   "ef": 400,
+   "recall": 1.0,
+   "med_ms": 5.978669039905071,
+   "p90_ms": 87.95212899567562,
+   "min_mean_ms": 4.931741853943095,
+   "buf_hit": 986,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 1,
+   "ef": 800,
+   "recall": 1.0,
+   "med_ms": 18.972969031892717,
+   "p90_ms": 154.4794101617299,
+   "min_mean_ms": 13.943334671785124,
+   "buf_hit": 1786,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 10,
+   "ef": 100,
+   "recall": 0.5175000000000001,
+   "med_ms": 1.7355210147798061,
+   "p90_ms": 15.9406724967994,
+   "min_mean_ms": 1.502640769467689,
+   "buf_hit": 389,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 10,
+   "ef": 200,
+   "recall": 0.7475,
+   "med_ms": 6.394877971615642,
+   "p90_ms": 91.02634151931859,
+   "min_mean_ms": 3.3339640765916556,
+   "buf_hit": 591,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 10,
+   "ef": 400,
+   "recall": 0.9425000000000001,
+   "med_ms": 9.244693967048079,
+   "p90_ms": 121.27628194866703,
+   "min_mean_ms": 6.160378560889512,
+   "buf_hit": 991,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 10,
+   "ef": 800,
+   "recall": 0.99,
+   "med_ms": 152.03068096889183,
+   "p90_ms": 452.3221574607307,
+   "min_mean_ms": 84.97456544428132,
+   "buf_hit": 1791,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 20,
+   "ef": 100,
+   "recall": 0.3675,
+   "med_ms": 1.7305035144090652,
+   "p90_ms": 6.489413802046334,
+   "min_mean_ms": 1.4866648212773725,
+   "buf_hit": 386,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 20,
+   "ef": 200,
+   "recall": 0.6025,
+   "med_ms": 5.198469501920044,
+   "p90_ms": 34.52220254112036,
+   "min_mean_ms": 3.6109003762248904,
+   "buf_hit": 586,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 20,
+   "ef": 400,
+   "recall": 0.85,
+   "med_ms": 70.06566098425537,
+   "p90_ms": 324.12719863932585,
+   "min_mean_ms": 32.1744171786122,
+   "buf_hit": 988,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 20,
+   "ef": 800,
+   "recall": 0.9600000000000002,
+   "med_ms": 289.9505334789865,
+   "p90_ms": 1037.8929019672798,
+   "min_mean_ms": 121.05990007403307,
+   "buf_hit": 1788,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 1,
+   "ef": 100,
+   "recall": 0.975,
+   "med_ms": 11.94862648844719,
+   "p90_ms": 83.0097395228222,
+   "min_mean_ms": 5.690225781290792,
+   "buf_hit": 278,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 1,
+   "ef": 200,
+   "recall": 1.0,
+   "med_ms": 9.799852967262268,
+   "p90_ms": 95.80135742435237,
+   "min_mean_ms": 5.321610163082369,
+   "buf_hit": 378,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 1,
+   "ef": 400,
+   "recall": 1.0,
+   "med_ms": 16.100482549518347,
+   "p90_ms": 148.08920817449695,
+   "min_mean_ms": 12.424607574939728,
+   "buf_hit": 578,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 1,
+   "ef": 800,
+   "recall": 1.0,
+   "med_ms": 78.90073250746354,
+   "p90_ms": 169.39865376334643,
+   "min_mean_ms": 36.86131838185247,
+   "buf_hit": 978,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 10,
+   "ef": 100,
+   "recall": 0.485,
+   "med_ms": 4.0473369881510735,
+   "p90_ms": 40.58665843913334,
+   "min_mean_ms": 3.3967494178796187,
+   "buf_hit": 278,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 10,
+   "ef": 200,
+   "recall": 0.73,
+   "med_ms": 6.759568466804922,
+   "p90_ms": 64.20962518313908,
+   "min_mean_ms": 5.133977913646959,
+   "buf_hit": 383,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 10,
+   "ef": 400,
+   "recall": 0.9400000000000001,
+   "med_ms": 69.74962702952325,
+   "p90_ms": 248.142657475546,
+   "min_mean_ms": 33.93990410550032,
+   "buf_hit": 584,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 10,
+   "ef": 800,
+   "recall": 0.9925,
+   "med_ms": 151.83202899061143,
+   "p90_ms": 339.5487566711382,
+   "min_mean_ms": 75.09177284664474,
+   "buf_hit": 981,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 20,
+   "ef": 100,
+   "recall": 0.34750000000000003,
+   "med_ms": 5.094878433737904,
+   "p90_ms": 48.12220111489297,
+   "min_mean_ms": 3.256798384245485,
+   "buf_hit": 282,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 20,
+   "ef": 200,
+   "recall": 0.5725,
+   "med_ms": 8.642364467959851,
+   "p90_ms": 132.772728102282,
+   "min_mean_ms": 5.873917648568749,
+   "buf_hit": 380,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 20,
+   "ef": 400,
+   "recall": 0.8225000000000001,
+   "med_ms": 49.71597949042916,
+   "p90_ms": 167.22864388721067,
+   "min_mean_ms": 25.253809479181655,
+   "buf_hit": 581,
+   "buf_read": 0
+  },
+  {
+   "engine": "acorn_g2pe_mf_cache",
+   "sel": 20,
+   "ef": 800,
+   "recall": 0.96,
+   "med_ms": 222.83032402629033,
+   "p90_ms": 803.976948477794,
+   "min_mean_ms": 109.36152153881267,
+   "buf_hit": 981,
+   "buf_read": 0
+  }
+ ]
+}
