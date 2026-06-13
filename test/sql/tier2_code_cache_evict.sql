@@ -69,7 +69,9 @@ BEGIN
         'ORDER BY embedding <-> ''[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]''::vector '
         'LIMIT 5) s', tbl) INTO r;
     RESET enable_seqscan;
-    RESET pg_acorn.scan_code_cache;
+    -- Cache now defaults ON: explicitly turn it OFF (not RESET) so the helper
+    -- never leaks an enabled cache between cache=false truth captures.
+    SET pg_acorn.scan_code_cache = off;
     RETURN r;
 END;
 $$ LANGUAGE plpgsql;
@@ -81,19 +83,28 @@ CREATE TABLE truth_b AS SELECT topk('b', false) AS ids;
 ------------------------------------------------------------------------
 -- (a) whole-slot LRU eviction under a tight budget.
 ------------------------------------------------------------------------
+-- Guarantee a clean directory right before the warm-A sequence: the truth_a/
+-- truth_b captures above ran with the cache OFF, but with the GUC now default
+-- ON any incidental scan elsewhere could have loaded a slot, and a stray slot
+-- would consume the 1MB budget and break the LRU-victim determinism below.
+DO $$ BEGIN PERFORM pg_acorn_code_cache_reset(); END $$;
+
 SET pg_acorn.code_cache_size = 1;     -- 1MB: holds ~one of these indexes
 
 -- Warm A: it becomes the sole resident slot.
 SELECT topk('a', true) = (SELECT ids FROM truth_a) AS a_warm_correct;
 SELECT count(*) = 1 AS one_slot_after_a FROM pg_acorn_code_cache_stats();
+-- Among this test's own indexes, exactly A is resident (orphan-immune).
 SELECT indexrelid = 'a_idx'::regclass AS a_is_resident
-FROM pg_acorn_code_cache_stats();
+FROM pg_acorn_code_cache_stats()
+WHERE indexrelid IN ('a_idx'::regclass, 'b_idx'::regclass);
 
 -- Warm B: admission must evict the LRU (A) to make room.
 SELECT topk('b', true) = (SELECT ids FROM truth_b) AS b_warm_correct;
 SELECT count(*) = 1 AS one_slot_after_b FROM pg_acorn_code_cache_stats();
 SELECT indexrelid = 'b_idx'::regclass AS b_is_resident
-FROM pg_acorn_code_cache_stats();
+FROM pg_acorn_code_cache_stats()
+WHERE indexrelid IN ('a_idx'::regclass, 'b_idx'::regclass);
 
 -- A was evicted: its scan now falls back to the element page, still exact.
 SELECT topk('a', true) = (SELECT ids FROM truth_a) AS a_correct_after_evict;
@@ -176,5 +187,39 @@ SELECT (SELECT bytes FROM pg_acorn_code_cache_stats()
         WHERE indexrelid = 'c_idx'::regclass)
        < (SELECT nelems FROM pg_acorn_code_cache_stats()
           WHERE indexrelid = 'c_idx'::regclass) * 256 AS c_bytes_bounded;
+
+------------------------------------------------------------------------
+-- (d) aborted scan must leave active_scans at 0 (the eviction leak guard).
+--
+-- A query that errors mid-scan tears the executor down WITHOUT amendscan; a
+-- transaction-abort callback must still drop the cache scan ref.  If it leaks,
+-- the slot stays pinned (active_scans > 0) and reset() — which only evicts
+-- active_scans == 0 slots — can never reclaim it.  Warm C, abort a scan inside
+-- a subtransaction (PL/pgSQL EXCEPTION block), then assert reset() reclaims
+-- C's slot: it can only do so if the aborted scan's ref was released.
+------------------------------------------------------------------------
+DO $$ BEGIN PERFORM pg_acorn_code_cache_reset(); END $$;
+SELECT topk('c', true) IS NOT NULL AS c_rewarmed_before_abort;
+SELECT EXISTS (SELECT 1 FROM pg_acorn_code_cache_stats()
+               WHERE indexrelid = 'c_idx'::regclass) AS c_resident_before_abort;
+
+-- Abort a scan mid-flight: the index scan begins, then the projection errors
+-- (division by zero) before the executor reaches endscan.  Trapped so the
+-- regression session survives.
+DO $$
+BEGIN
+    PERFORM id, 1 / (id - id)
+    FROM c WHERE bucket < 3
+    ORDER BY embedding <-> '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'::vector LIMIT 5;
+EXCEPTION WHEN division_by_zero THEN
+    NULL;  -- expected: the scan was torn down by the abort
+END $$;
+
+-- The abort released the scan ref, so reset() can reclaim C's slot (count >= 1)
+-- and no slot for c_idx survives.  A leak would leave reset() unable to evict
+-- it and the slot would still be present here.
+SELECT pg_acorn_code_cache_reset() >= 1 AS reset_reclaims_after_abort;
+SELECT NOT EXISTS (SELECT 1 FROM pg_acorn_code_cache_stats()
+                   WHERE indexrelid = 'c_idx'::regclass) AS c_gone_after_abort_reset;
 
 DROP SCHEMA test_cc_evict CASCADE;

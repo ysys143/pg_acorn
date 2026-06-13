@@ -7,7 +7,7 @@
 -- re-ranked with exact distances, so at an expansion budget that exhausts
 -- the frontier the result list is byte-identical to the cache-off scan.
 --
--- Tests: GUC defaults (off / 512MB); identical ordered id lists for
+-- Tests: GUC defaults (on / 512MB); identical ordered id lists for
 -- cache=off vs cache=on cold (load happens in this scan) vs cache=on warm
 -- (READY slot, pure hits); the same list matches the exact seqscan truth;
 -- filter correctness + k results at a small ef; code_cache_size=0 disables
@@ -25,7 +25,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_acorn;
 SET search_path = test_tier2_cc, public;
 
--- Defaults: cache off, 512MB budget.
+-- Defaults: cache now defaults ON, 512MB budget.
 SHOW pg_acorn.scan_code_cache;
 SHOW pg_acorn.code_cache_size;
 

@@ -50,6 +50,7 @@
 #include "postgres.h"
 
 #include "access/relation.h"
+#include "access/xact.h"
 #include "catalog/pg_authid.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -209,7 +210,13 @@ struct AcornCodeCacheScan
 	Size			stride;
 	int				dim;			/* code length */
 	uint32			generation;		/* slot generation at attach (evict guard) */
-	bool			scan_active;	/* this backend holds an active-scan ref */
+	int				scan_refs;		/* active-scan refs this backend holds on the
+									 * slot via THIS handle.  A COUNT, not a bool:
+									 * the handle is shared per (dboid,relnumber),
+									 * so two overlapping scans on the same index
+									 * in one backend (e.g. a self-join) each take
+									 * a ref and must each be balanced.  Each ref
+									 * is one slot->active_scans increment. */
 };
 
 typedef struct AcornCCAttachKey
@@ -231,6 +238,10 @@ static HTAB *acorn_cc_attached = NULL;
 static AcornCCAttachEntry *acorn_cc_attach_find(Oid dboid,
 											   RelFileNumber relnumber,
 											   bool *found);
+static void acorn_cc_xact_callback(XactEvent event, void *arg);
+static void acorn_cc_subxact_callback(SubXactEvent event,
+									  SubTransactionId mySubid,
+									  SubTransactionId parentSubid, void *arg);
 
 /* -----------------------------------------------------------------------
  * Directory attach
@@ -627,6 +638,16 @@ acorn_cc_attach_init(void)
 	acorn_cc_attached = hash_create("acorn_codecache attachments", 8,
 									&info,
 									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/*
+	 * Balance any active-scan ref on transaction/subtransaction abort: an
+	 * aborting query tears the executor down without running amendscan, so
+	 * without this the slot's active_scans would leak and the slot could never
+	 * be evicted.  Registered once, lazily, the first time this backend
+	 * touches the cache (paired with the TopMemoryContext-lived attach cache).
+	 */
+	RegisterXactCallback(acorn_cc_xact_callback, NULL);
+	RegisterSubXactCallback(acorn_cc_subxact_callback, NULL);
 }
 
 static AcornCCAttachEntry *
@@ -668,7 +689,7 @@ acorn_cc_attach_store(Oid dboid, RelFileNumber relnumber,
 	e->scan.stride = stride;
 	e->scan.dim = dim;
 	e->scan.generation = generation;
-	e->scan.scan_active = false;
+	e->scan.scan_refs = 0;
 	return e;
 }
 
@@ -996,13 +1017,18 @@ acorn_cc_scan_acquire(AcornCodeCacheDirectory *dir, AcornCodeCacheScan *cc,
 		(st != ACORN_CC_STATE_READY && st != ACORN_CC_STATE_PARTIAL) ||
 		cc->dboid != slot->dboid || cc->relnumber != slot->relnumber)
 	{
-		/* slot died under us (evicted/reloaded): drop the ref, fail */
+		/*
+		 * Slot died under us (evicted/reloaded): drop only the ref we just
+		 * added.  scan_refs counts SUCCESSFUL acquires, so a back-out must not
+		 * touch it — another overlapping scan on this shared handle may legitly
+		 * hold refs we must not clobber.
+		 */
 		pg_atomic_fetch_sub_u32(&slot->active_scans, 1);
-		cc->scan_active = false;
 		return false;
 	}
 
-	cc->scan_active = true;
+	/* successful acquire: one more balanced ref on this handle */
+	cc->scan_refs++;
 	pg_atomic_write_u64(&slot->lastused, acorn_cc_tick(dir));
 
 	/* refresh snapshot AFTER the ref is visible and the slot is confirmed live */
@@ -1100,19 +1126,22 @@ acorn_codecache_begin_scan(Relation index, int dim)
 }
 
 /*
- * Release the active-scan reference taken by begin_scan.  Drains the slot's
- * retire list if this was the last active scan (the reclaim grace point).
- * Idempotent and NULL-safe so the AM can call it unconditionally at endscan.
+ * Drop ONE held active-scan ref on this handle (the per-begin_scan match for
+ * the normal endscan path), decrementing slot->active_scans.  If this drops
+ * the slot's last in-flight reader, drain its retire list (the reclaim grace
+ * point).  NULL-safe and balances exactly one begin_scan: the handle is shared
+ * per (dboid,relnumber), so it can hold more than one ref (overlapping scans);
+ * each end drops one.  A call with no held ref is a no-op.
  */
-void
-acorn_codecache_end_scan(AcornCodeCacheScan *cc)
+static void
+acorn_cc_release_one_ref(AcornCodeCacheScan *cc)
 {
 	AcornCodeCacheSlot *slot;
 
-	if (cc == NULL || !cc->scan_active)
+	if (cc == NULL || cc->scan_refs <= 0)
 		return;
 	slot = cc->slot;
-	cc->scan_active = false;
+	cc->scan_refs--;
 
 	/* publish all our reads before dropping the ref */
 	pg_memory_barrier();
@@ -1128,6 +1157,74 @@ acorn_codecache_end_scan(AcornCodeCacheScan *cc)
 		acorn_cc_drain_retired(cc->area, slot);
 		LWLockRelease(&slot->wlock);
 	}
+}
+
+/*
+ * Drop EVERY held active-scan ref on this handle.  Used by abort cleanup,
+ * where any number of overlapping scans on this index were torn down at once
+ * without their endscans running.  Equivalent to calling release_one_ref until
+ * the handle holds no ref.
+ */
+static void
+acorn_cc_release_all_refs(AcornCodeCacheScan *cc)
+{
+	while (cc != NULL && cc->scan_refs > 0)
+		acorn_cc_release_one_ref(cc);
+}
+
+/*
+ * Release the active-scan reference taken by begin_scan.  Drains the slot's
+ * retire list if this was the last active scan (the reclaim grace point).
+ * Idempotent and NULL-safe so the AM can call it unconditionally at endscan.
+ */
+void
+acorn_codecache_end_scan(AcornCodeCacheScan *cc)
+{
+	acorn_cc_release_one_ref(cc);
+}
+
+/*
+ * Transaction/subtransaction ABORT cleanup: balance any active-scan ref this
+ * backend still holds.
+ *
+ * The AM calls end_scan at amendscan/amrescan, but an aborting query or
+ * transaction tears the executor down WITHOUT running amendscan (PostgreSQL
+ * reclaims executor state via memory-context resets and resource owners, not
+ * index_endscan).  The cc handle lives in TopMemoryContext (the attach cache),
+ * so its held scan refs would otherwise survive the abort and leave
+ * slot->active_scans permanently elevated — a slot that eviction and
+ * pg_acorn_code_cache_reset() (both gated on active_scans == 0) can never
+ * reclaim.  Walking the backend's attach cache here and dropping every held
+ * ref restores the invariant: active_scans returns to 0 when a scan ends for
+ * ANY reason.
+ */
+static void
+acorn_cc_release_all_scan_refs(void)
+{
+	HASH_SEQ_STATUS seq;
+	AcornCCAttachEntry *att;
+
+	if (acorn_cc_attached == NULL)
+		return;
+
+	hash_seq_init(&seq, acorn_cc_attached);
+	while ((att = (AcornCCAttachEntry *) hash_seq_search(&seq)) != NULL)
+		acorn_cc_release_all_refs(&att->scan);
+}
+
+static void
+acorn_cc_xact_callback(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+		acorn_cc_release_all_scan_refs();
+}
+
+static void
+acorn_cc_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+						  SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		acorn_cc_release_all_scan_refs();
 }
 
 /*
