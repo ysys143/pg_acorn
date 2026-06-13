@@ -1185,41 +1185,54 @@ acorn_cc_resolve_blocks(AcornCodeCacheScan *cc, BlockNumber blkno)
 	return cc->blocks;
 }
 
-bool
-acorn_codecache_lookup(AcornCodeCacheScan *cc,
-					   BlockNumber blkno, OffsetNumber offno,
-					   AcornCodeCacheHit *out)
+const AcornCodeCacheEntry *
+acorn_codecache_resolve(AcornCodeCacheScan *cc,
+						BlockNumber blkno, OffsetNumber offno)
 {
 	dsa_pointer *blocks;
 	dsa_pointer page_dp;
 	AcornCCPageHdr *ph;
-	AcornCodeCacheEntry *e;
 	int			dim = cc->dim;
 
 	if (dim <= 0 || dim > ACORN_CC_MAX_DIM)
-		return false;
+		return NULL;
 
 	blocks = acorn_cc_resolve_blocks(cc, blkno);
 	if (blocks == NULL)
-		return false;
+		return NULL;
 	page_dp = blocks[blkno];
 	if (!DsaPointerIsValid(page_dp))
-		return false;
+		return NULL;
 	ph = (AcornCCPageHdr *) dsa_get_address(cc->area, page_dp);
 	if (offno < 1 || offno > ph->nslots)
+		return NULL;
+	return ACORN_CC_PAGE_ENTRY(ph, offno, cc->stride);
+}
+
+bool
+acorn_codecache_read(AcornCodeCacheScan *cc,
+					 const AcornCodeCacheEntry *e,
+					 AcornCodeCacheHit *out)
+{
+	int			dim = cc->dim;
+
+	if (e == NULL || dim <= 0 || dim > ACORN_CC_MAX_DIM)
 		return false;
-	e = ACORN_CC_PAGE_ENTRY(ph, offno, cc->stride);
 
 	/*
 	 * Seqlock copy-out: read an even version, copy the fixed header + code,
 	 * then re-read; an odd or changed version means a concurrent
 	 * insert/vacuum touched this entry, so fall back (G4).  One retry covers
 	 * the common case where the snapshot landed mid-write; persistent churn
-	 * (never in M2's single-writer-per-slot path) falls back too.
+	 * (never in M2's single-writer-per-slot path) falls back too.  `e` is the
+	 * resolved entry pointer; the version field is mutated in place by the
+	 * writer (a const cast for the atomic read is sound — pg_atomic_read does
+	 * not write).
 	 */
 	for (int attempt = 0; attempt < 2; attempt++)
 	{
-		uint32	v0 = pg_atomic_read_u32(&e->version);
+		pg_atomic_uint32 *ver = (pg_atomic_uint32 *) &e->version;
+		uint32	v0 = pg_atomic_read_u32(ver);
 		uint32	v1;
 
 		if (v0 & 1)
@@ -1232,7 +1245,7 @@ acorn_codecache_lookup(AcornCodeCacheScan *cc,
 			/* re-check version: a concurrent insert may be turning a
 			 * vacuumed slot back into a live one */
 			pg_read_barrier();
-			if (pg_atomic_read_u32(&e->version) != v0)
+			if (pg_atomic_read_u32(ver) != v0)
 				continue;
 			return false;
 		}
@@ -1248,12 +1261,22 @@ acorn_codecache_lookup(AcornCodeCacheScan *cc,
 		memcpy(out->code, e->code, dim);
 
 		pg_read_barrier();
-		v1 = pg_atomic_read_u32(&e->version);
+		v1 = pg_atomic_read_u32(ver);
 		if (v1 == v0)
 			return true;		/* stable snapshot */
 		/* changed under us: retry once, then fall back */
 	}
 	return false;
+}
+
+bool
+acorn_codecache_lookup(AcornCodeCacheScan *cc,
+					   BlockNumber blkno, OffsetNumber offno,
+					   AcornCodeCacheHit *out)
+{
+	const AcornCodeCacheEntry *e = acorn_codecache_resolve(cc, blkno, offno);
+
+	return acorn_codecache_read(cc, e, out);
 }
 
 /* -----------------------------------------------------------------------
