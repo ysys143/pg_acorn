@@ -62,7 +62,7 @@ So the deployment tradeoff at 250K is:
 - cache: 1.5-1.7x slower than inline, 289 MB, still beats pgvector.
 - non-inline (no cache): smallest, but loses to pgvector.
 
-## Recommendation
+## Recommendation (original, pre-optimization — SUPERSEDED below)
 
 Do NOT flip the defaults. Keep `acorn_inline_vectors` default on and
 `pg_acorn.scan_code_cache` default OFF. The cache ships as an opt-in
@@ -71,3 +71,39 @@ budget. Revisit the default at n>=1M, where the 16 GB-extrapolated inline
 index thrashes shared_buffers and the cache's bounded 160 MB-extrapolated
 footprint should turn the locality penalty into a win — that crossover is the
 next thing worth measuring before any default change.
+
+## Update 2026-06-14 — software prefetch + default graduated to ON
+
+The 1.5-1.7x penalty was DRAM-miss latency on the separate SQ8 code region
+(pointer-chase). A software-prefetch pipeline (lookup split into resolve +
+seqlock-read; each neighbor's entry `__builtin_prefetch`ed K=6 ahead in the
+discovery loop) hid it. Re-measured:
+
+- 60K controlled before/after (same fixture, binary-only swap, min-of-15):
+  1.17-2.12x cache speedup at the high-ef money cells; cache reaches <=1.3x
+  inline.
+- 250K within-run: cache 0.88-0.90x inline at the sel=10%/20% ef=800 money
+  cells (cache now at/below inline at the expensive operating points); the one
+  >1.3x cell is sel=1% ef=200, where both are <6 ms and there are too few
+  discoveries to amortize a prefetch.
+
+Why the cache can now match/beat inline: it touches ~half the pages inline
+does (no per-neighbor element-page pin; 981 vs 1791 buffers at ef=800), and
+prefetch removed the DRAM-miss tax that previously masked that advantage.
+
+Defaults flipped: `pg_acorn.scan_code_cache` now defaults **ON**. (The
+`acorn_inline_vectors` reloption was already default OFF, so the DEFAULT index
+is the 249 MB non-inline layout — now cache-served, hence fast. inline stays
+an explicit opt-in for lowest-latency / low-ef-dominated workloads.)
+
+Flipping the default to ON surfaced a latent bug it then fixed (commit
+c6148ce): `slot->active_scans` leaked on (a) aborted scans (amendscan skipped)
+and (b) overlapping same-index scans (a self-join; the old bool ref-flag could
+only track one). A leaked ref left a slot permanently non-evictable. Fixed
+with an int refcount + transaction/subtransaction abort callbacks; a regression
+guard (aborted-scan -> reset reclaims) was added to tier2_code_cache_evict.
+docker-test 19+4 green; eviction-churn stress PASS.
+
+Open item unchanged: the n>=1M crossover is still worth measuring — at that
+scale inline thrashes shared_buffers and the cache should win outright, not
+just match.
