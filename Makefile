@@ -33,6 +33,7 @@ REGRESS = \
 	tier2_ef_search \
 	tier2_payload_edges \
 	tier2_payload_m \
+	tier2_payload_gate \
 	tier2_diversify \
 	tier2_inline_vectors \
 	tier2_code_cache \

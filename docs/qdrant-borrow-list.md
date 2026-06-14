@@ -96,7 +96,25 @@ analysis below.
 - Feasibility: MEDIUM. A mapping table / formula from the gamma-sweep data.
 - Impact: MEDIUM — usability; removes the per-workload ef-tuning burden.
 
-## Priority 4 — gate payload links by partition cardinality
+## Priority 4 — gate payload links by partition cardinality — DONE
+
+SHIPPED as `acorn_payload_min_cardinality` (reloption, default 0 = off): at build
+time a node whose filter-value partition has fewer than this many members gets NO
+payload (same-partition) edges; those layer-0 slots are filled with global links
+instead. Slot COUNT is unchanged (global fills the payload region), so the
+on-disk format and the scan are untouched — purely a build-time neighbor change.
+Per-partition counts come from the P3 build pre-scan (exact, int4 filters);
+applied in the in-memory build path (the common case; on-disk overflow + insert
+keep graceful degradation). Test `tier2_payload_gate.sql`.
+
+HONEST NOTE: the CORE of this item was ALREADY implemented before P4 — the build
+has "graceful degradation" in both paths (acorn_build.c) that fills under-fillable
+payload slots with global links. That already reclaims the wasted slots whenever
+a partition is too small to fill the payload half. The `acorn_payload_min_card`
+knob adds the EXPLICIT Qdrant-style threshold: it also skips payload edges for
+partitions in the [payload_m, threshold) range (large enough to fill, but small
+enough to go exact anyway), which graceful degradation alone does not. Original
+analysis below.
 
 - Qdrant: builds the payload sub-graph only for blocks with cardinality >=
   the (point-converted) full_scan_threshold; tiny blocks get none
@@ -153,5 +171,10 @@ that cost debugging time during Phase C/D. Original analysis below.
    tiny-cardinality -> prefilter via n_expand saturation); changing it adds the
    documented mid-band regression risk for no measurable gain
    (bench/REPORT_plan_choice.md).
-5. Priority 4 (gate payload links by cardinality) — opportunistic; the only
-   remaining borrow-list item.
+5. Priority 4 (gate payload links by cardinality) — DONE
+   (acorn_payload_min_cardinality). Core was already present (build graceful
+   degradation); the knob adds the explicit Qdrant-style threshold.
+
+All borrow-list items are now addressed (P1/P3/P4/P5 shipped, P2 investigated +
+declined with evidence). Remaining acorn work is its own roadmap (high-selectivity
+per-expansion overhead; >=1M crossover), not Qdrant borrows.

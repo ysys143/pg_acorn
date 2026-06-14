@@ -64,6 +64,20 @@
 #define ACORN_AUTOEF_RF_MAX          4.0
 
 /*
+ * acorn_payload_min_cardinality (Priority 4, Qdrant full_scan_threshold analog):
+ * at build time, a node whose filter-value partition has fewer than this many
+ * members gets NO payload edges -- those slots are filled with global links
+ * instead (the existing graceful-degradation fill).  Such tiny filtered sets are
+ * served by the exact prefilter anyway (see acorn_cost.c), so payload
+ * connectivity for them is wasted.  0 = off (current behaviour: payload edges
+ * for every partition, with graceful degradation only when a half cannot fill).
+ * int4 filter columns only (uses the build histogram's partition counts).
+ */
+#define ACORN_DEFAULT_PAYLOAD_MIN_CARD  0
+#define ACORN_MIN_PAYLOAD_MIN_CARD      0
+#define ACORN_MAX_PAYLOAD_MIN_CARD      1000000
+
+/*
  * Parsed reloptions for an acorn_hnsw index.  Layout must start with int32
  * vl_len_ for build_reloptions().
  */
@@ -77,6 +91,7 @@ typedef struct AcornOptions
 	bool		payloadEdges;	/* split layer-0 slots: half global / half same-partition */
 	bool		diversify;		/* HNSW diversity heuristic in neighbor selection */
 	bool		inlineVectors;	/* co-locate SQ8 vectors + metadata in neighbor lists */
+	int			payloadMinCard;	/* P4: skip payload edges for partitions smaller than this (0 = off) */
 } AcornOptions;
 
 /* -----------------------------------------------------------------------

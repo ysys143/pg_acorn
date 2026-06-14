@@ -135,6 +135,13 @@ acorn_opt_payload_m(Relation index)
 	return opts ? opts->payloadM : ACORN_DEFAULT_PAYLOAD_M;
 }
 
+static int
+acorn_opt_payload_min_card(Relation index)
+{
+	AcornOptions *opts = (AcornOptions *) index->rd_options;
+	return opts ? opts->payloadMinCard : ACORN_DEFAULT_PAYLOAD_MIN_CARD;
+}
+
 static bool
 acorn_opt_payload_edges(Relation index)
 {
@@ -321,10 +328,14 @@ acorn_int64_cmp(const void *a, const void *b)
  *
  * v1 supports int4 filter columns (acorn's filter type — the int4 fast path,
  * tests, and benches); other types get no histogram and fall back to manual ef.
+ *
+ * Also fills part_count_out[ACORN_PAYLOAD_PARTITIONS] (caller-zeroed) with the
+ * EXACT per-partition member counts for P4 payload gating, and returns true iff
+ * an int4 filter column was scanned (counts valid).  Same single scan.
  */
-static void
+static bool
 acorn_build_filter_histogram(Relation heap, Relation index, IndexInfo *indexInfo,
-							 AcornT2Histogram *out)
+							 AcornT2Histogram *out, int *part_count_out)
 {
 	AttrNumber		heap_attno;
 	TableScanDesc	scan;
@@ -342,12 +353,12 @@ acorn_build_filter_histogram(Relation heap, Relation index, IndexInfo *indexInfo
 
 	/* Need a second key column (the filter) and v1 requires it to be int4. */
 	if (IndexRelationGetNumberOfKeyAttributes(index) < 2)
-		return;
+		return false;
 	if (TupleDescAttr(RelationGetDescr(index), 1)->atttypid != INT4OID)
-		return;
+		return false;
 	heap_attno = indexInfo->ii_IndexAttrNumbers[1];
 	if (heap_attno <= 0)			/* expression key: no plain column to sample */
-		return;
+		return false;
 
 	pg_prng_seed(&rng,
 				 (uint64) (acorn_build_seed >= 0 ? acorn_build_seed : 0x9E3779B9u));
@@ -366,6 +377,8 @@ acorn_build_filter_histogram(Relation heap, Relation index, IndexInfo *indexInfo
 			continue;
 		v = (int64) DatumGetInt32(d);	/* signed int32 space (matches eval_filter) */
 		seen++;
+		if (part_count_out)				/* P4: exact per-partition member counts */
+			part_count_out[((uint64) v) & (ACORN_PAYLOAD_PARTITIONS - 1)]++;
 		if (k < cap)
 			buf[k++] = v;
 		else
@@ -403,6 +416,7 @@ acorn_build_filter_histogram(Relation heap, Relation index, IndexInfo *indexInfo
 		out->ndistinct = ndistinct;
 	}
 	pfree(buf);
+	return true;	/* int4 filter scanned -> part_count_out is valid */
 }
 
 static void
@@ -899,6 +913,11 @@ typedef struct AcornShared
 	int			entry_level;
 	bool		flushed;		/* under flushLock */
 	int			part_entry[ACORN_PAYLOAD_PARTITIONS];	/* under partLock */
+	int			part_count[ACORN_PAYLOAD_PARTITIONS];	/* P4: final per-partition
+													 * member counts; filled by the
+													 * leader before workers start,
+													 * read-only afterwards */
+	bool		part_count_valid;	/* P4: part_count populated (int4 filter) */
 } AcornShared;
 
 #define ParallelTableScanFromAcornShared(shared) \
@@ -922,6 +941,10 @@ typedef struct AcornMemBuild
 	Size			entry_size;		/* inline entry stride (inline mode) */
 	int			   *part_entry;		/* partition -> first member node id, -1 = none
 									 * (parallel: points at shared->part_entry) */
+	int			   *part_count;		/* P4: partition -> final member count, or NULL
+									 * when gating is off / counts unavailable
+									 * (parallel: points at shared->part_count) */
+	int				payload_min_card;	/* P4 threshold; 0 = off */
 	MemoryContext	build_ctx;
 	/* maintenance_work_mem accounting (serial; parallel uses the arena) */
 	Size			mem_used;		/* bytes allocated for the graph so far */
@@ -1012,6 +1035,8 @@ acorn_mem_build_init(MemoryContext ctx)
 	mb->part_entry  = palloc(ACORN_PAYLOAD_PARTITIONS * sizeof(int));
 	for (int p = 0; p < ACORN_PAYLOAD_PARTITIONS; p++)
 		mb->part_entry[p] = -1;
+	mb->part_count       = NULL;	/* P4: set when gating is active */
+	mb->payload_min_card = 0;
 	mb->mem_used    = mb->capacity * (sizeof(AcornMemNode) + sizeof(uint32))
 		+ sizeof(AcornMemBuild) + ACORN_PAYLOAD_PARTITIONS * sizeof(int);
 	mb->mem_total   = (Size) maintenance_work_mem * 1024;
@@ -1775,6 +1800,9 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 			int  n_global;
 			int  p_filled = 0;
 			int *g_sel    = palloc(sizeof(int) * g_half);
+			/* P4: gate payload edges for tiny partitions (filled with global below) */
+			bool gate     = (mb->part_count != NULL &&
+							 mb->part_count[part] < mb->payload_min_card);
 
 			/* Global half: diversity-select up to g_half from the beam */
 			if (diversify)
@@ -1795,7 +1823,7 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 			if (sh)
 				LWLockRelease(&sh->partLock);
 
-			if (part_ep >= 0)
+			if (!gate && part_ep >= 0)
 			{
 				int    *p_ids   = palloc(sizeof(int) * efc);
 				double *p_dists = palloc(sizeof(double) * efc);
@@ -3198,6 +3226,14 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 				 * restricted search (W limited to the partition, exploration
 				 * unrestricted, work capped).
 				 */
+				/*
+				 * P4 payload gating (acorn_payload_min_cardinality) is applied
+				 * only in the in-memory build path; this on-disk overflow /
+				 * incremental-insert path keeps building payload edges (graceful
+				 * degradation still reclaims unfillable slots).  A well-configured
+				 * build of the high-cardinality workloads P4 targets stays
+				 * in-memory; gating here is future work.
+				 */
 				int			g_half   = m_eff;			/* global half = m_eff */
 				int			p_half   = payload_m;		/* payload half = payload_m */
 				int			n_global;
@@ -3668,6 +3704,8 @@ acorn_init_build_state(AcornBuildState *bs, Relation heap, Relation index,
 	bs->mb->payload_edges  = acorn_opt_payload_edges(index) && bs->has_filter;
 	/* layer-0 payload-half width (= m_eff when symmetric) */
 	bs->mb->payload_m      = acorn_payload_m_eff(index);
+	/* P4: payload gating threshold (0 = off); part_count wired by the caller */
+	bs->mb->payload_min_card = acorn_opt_payload_min_card(index);
 	bs->mb->inline_vectors = acorn_opt_inline_vectors(index);
 	bs->mb->dims           = dims;
 	bs->mb->entry_size     = bs->mb->inline_vectors
@@ -3691,6 +3729,9 @@ acorn_attach_shared(AcornBuildState *bs, AcornShared *shared, char *area)
 	mb->nodes      = (AcornMemNode *) area;	/* node array at arena start */
 	mb->capacity   = shared->max_nodes;
 	mb->part_entry = shared->part_entry;
+	/* P4: parallel participants read the leader-filled shared partition counts */
+	if (mb->payload_min_card > 0 && shared->part_count_valid)
+		mb->part_count = shared->part_count;
 	/* per-process visited generations sized to the shared capacity */
 	mb->visit_gen  = (uint32 *)
 		MemoryContextAllocZero(mb->build_ctx,
@@ -4009,7 +4050,8 @@ acorn_end_parallel(AcornLeader *leader)
  * bounds the parallel graph).
  */
 static void
-acorn_begin_parallel(AcornBuildState *bs, bool isconcurrent, int request)
+acorn_begin_parallel(AcornBuildState *bs, bool isconcurrent, int request,
+					 const int *part_count)
 {
 	ParallelContext *pcxt;
 	Snapshot	snapshot;
@@ -4109,6 +4151,11 @@ acorn_begin_parallel(AcornBuildState *bs, bool isconcurrent, int request)
 	LWLockInitialize(&shared->partLock, acorn_lock_tranche_id);
 	for (int p = 0; p < ACORN_PAYLOAD_PARTITIONS; p++)
 		shared->part_entry[p] = -1;
+	/* P4: publish the leader's partition counts for worker payload gating */
+	shared->part_count_valid = (part_count != NULL);
+	if (part_count != NULL)
+		memcpy(shared->part_count, part_count,
+			   ACORN_PAYLOAD_PARTITIONS * sizeof(int));
 
 	shm_toc_insert(pcxt->toc, PARALLEL_KEY_ACORN_SHARED, shared);
 	shm_toc_insert(pcxt->toc, PARALLEL_KEY_ACORN_AREA, area);
@@ -4199,6 +4246,8 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 	AcornBuildState bs;
 	int				parallel_workers = 0;
 	AcornT2Histogram hist;
+	int				part_count[ACORN_PAYLOAD_PARTITIONS];	/* P4: per-partition counts */
+	bool			have_counts = false;
 
 	if (dims < 0)
 		dims = 0;
@@ -4247,8 +4296,10 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 	 * ambuildempty / INIT_FORKNUM path leaves it absent).
 	 */
 	hist.nbounds = 0;
+	memset(part_count, 0, sizeof(part_count));
 	if (heap != NULL && forkNum == MAIN_FORKNUM)
-		acorn_build_filter_histogram(heap, index, indexInfo, &hist);
+		have_counts = acorn_build_filter_histogram(heap, index, indexInfo,
+												   &hist, part_count);
 
 	acorn_create_meta_page(index, forkNum, m_eff, payload_m, efc, dims,
 						   inline_vectors ? ACORN_T2_META_INLINE_VECTORS : 0,
@@ -4260,7 +4311,22 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 	if (heap != NULL && forkNum == MAIN_FORKNUM)
 		parallel_workers = acorn_plan_parallel_workers(heap, index);
 	if (parallel_workers > 0)
-		acorn_begin_parallel(&bs, indexInfo->ii_Concurrent, parallel_workers);
+		acorn_begin_parallel(&bs, indexInfo->ii_Concurrent, parallel_workers,
+							 (bs.mb->payload_min_card > 0 && have_counts)
+							 ? part_count : NULL);
+
+	/*
+	 * P4 payload gating: serial build wires the partition counts directly
+	 * (a parallel build reads them from the leader-filled shared array via
+	 * acorn_attach_shared).  part_count stays NULL when gating is off or the
+	 * filter is not int4, so the gating check is a no-op then.
+	 */
+	if (bs.leader == NULL && bs.mb->payload_min_card > 0 && have_counts)
+	{
+		bs.mb->part_count = (int *)
+			MemoryContextAlloc(bs.graph_ctx, sizeof(part_count));
+		memcpy(bs.mb->part_count, part_count, sizeof(part_count));
+	}
 
 	if (heap != NULL)
 	{
