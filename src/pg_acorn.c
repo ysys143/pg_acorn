@@ -86,6 +86,14 @@ bool acorn_build_direct_dist = true;
 int acorn_build_seed = -1;
 
 /*
+ * GUC: build the base HNSW graph first, then add payload (partition) edges in a
+ * second pass over the finished graph.  Off (default) = the legacy interleaved
+ * layer-0 build.  Two-pass isolates the acorn-specific payload work so it can be
+ * parallelized independently; kept as a runtime toggle for A/B + rollback.
+ */
+bool acorn_build_payload_two_pass = false;
+
+/*
  * GUC: Tier 2 scan fast-path toggle — prefetch neighbor pages per expansion.
  * Default OFF: measured -10..-13% QPS on warm shared_buffers (every
  * PrefetchBuffer is a redundant buffer-table lookup when the page is already
@@ -326,6 +334,21 @@ _PG_init(void)
 		-1,			/* default: legacy PID-derived behavior */
 		-1,			/* min */
 		INT_MAX,	/* max */
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.build_payload_two_pass */
+	DefineCustomBoolVariable(
+		"pg_acorn.build_payload_two_pass",
+		"Build the base HNSW graph first, then add payload (partition) edges "
+		"in a second pass over the finished graph. Off = legacy interleaved "
+		"layer-0 build. Recall-equivalent; isolates payload work for "
+		"parallelization (A/B + rollback toggle).",
+		NULL,
+		&acorn_build_payload_two_pass,
+		false,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL

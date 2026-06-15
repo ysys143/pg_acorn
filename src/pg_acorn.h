@@ -17,6 +17,7 @@ extern bool acorn_buffered_emission;
 /* Build-path toggles */
 extern bool acorn_build_direct_dist;
 extern int  acorn_build_seed;
+extern bool acorn_build_payload_two_pass;
 
 /* Tier 2 scan fast-path toggles (debug/benchmark) */
 extern bool acorn_scan_direct_dist;

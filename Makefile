@@ -44,6 +44,7 @@ REGRESS = \
 	tier2_emission_order \
 	tier2_build_mwm \
 	tier2_build_parallel \
+	tier2_build_two_pass \
 	no_regression \
 	recall_filter \
 	recall_gamma \

@@ -966,6 +966,7 @@ typedef struct AcornMemBuild
 	uint32		   *visit_gen;		/* per-process generation-based visited set */
 	uint32			cur_gen;
 	bool			payload_edges;	/* split layer-0 slots global/partition halves */
+	bool			payload_two_pass;	/* build payload half in a 2nd pass (B3) */
 	int				payload_m;		/* layer-0 payload-half width (= m_eff symmetric) */
 	bool			inline_vectors;	/* co-locate SQ8 vectors in neighbor lists */
 	int				dims;			/* vector dimensions (inline mode) */
@@ -1826,7 +1827,7 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 											  ep_id, q, lc, efc,
 											  out_ids, out_dists);
 
-		if (lc == 0 && mb->payload_edges)
+		if (lc == 0 && mb->payload_edges && !mb->payload_two_pass)
 		{
 			/*
 			 * Split layer-0 slots: [start, start+g_half) = global nearest,
@@ -1964,28 +1965,35 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 		}
 		else
 		{
+			/*
+			 * Two-pass build: at layer 0 fill ONLY the global half now; the
+			 * payload half is added in pass 2 over the finished graph.  All
+			 * other cases fill the full layer width.
+			 */
+			int  fill_m = (lc == 0 && mb->payload_edges && mb->payload_two_pass)
+				? m_eff : layer_m;
 			int  n_sel;
-			int *sel = palloc(sizeof(int) * layer_m);
+			int *sel = palloc(sizeof(int) * fill_m);
 
 			if (diversify)
 				n_sel = acorn_mem_select_diverse(mb, dist, out_ids, out_dists,
-												 n_cands, layer_m, sel);
+												 n_cands, fill_m, sel);
 			else
 			{
-				n_sel = Min(n_cands, layer_m);
+				n_sel = Min(n_cands, fill_m);
 				memcpy(sel, out_ids, n_sel * sizeof(int));
 			}
 
 			for (int i = 0; i < n_sel; i++)
 				my_nbr[start + i] = sel[i];
 
-			/* Reverse edges with fixed-slot retry over the whole layer range */
+			/* Reverse edges with fixed-slot retry over the filled range */
 			for (int i = 0; i < n_sel; i++)
 			{
 				rev[n_rev].target     = sel[i];
 				rev[n_rev].slot_base  =
 					HnswNeighborStart(m_eff, mb->nodes[sel[i]].level, lc);
-				rev[n_rev].slot_count = layer_m;
+				rev[n_rev].slot_count = fill_m;
 				rev[n_rev].part       = -1;
 				n_rev++;
 			}
@@ -2032,6 +2040,170 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 	}
 
 	acorn_mem_register_part_entry(mb, node, new_id);
+}
+
+/*
+ * Two-pass payload edges (B3): add node `id`'s partition (payload) half over the
+ * already-completed base graph.  Mirrors the interleaved layer-0 payload block
+ * of acorn_mem_insert_node, but READS this node's global half (built in pass 1)
+ * for dedup instead of selecting it, and writes only the payload-half slot range
+ * [start+m_eff, start+m_eff+payload_m).  No insertion-order dependency: it reads
+ * only immutable base-graph edges + the complete part_entry[], so it is safe to
+ * run per node in any order after the base graph is finished.
+ */
+static void
+acorn_mem_build_payload_node(AcornMemBuild *mb, const AcornDistCtx *dist,
+							 int m_eff, int efc, bool diversify, int id)
+{
+	AcornMemNode *node     = &mb->nodes[id];
+	int			  level    = node->level;
+	int			 *my_nbr   = acorn_node_nbr(mb, node);
+	Datum		  q        = acorn_node_vec(mb, node);
+	AcornShared  *sh       = mb->shared;
+	int			  start    = HnswNeighborStart(m_eff, level, 0);
+	int			  g_half   = m_eff;
+	int			  p_half   = mb->payload_m;
+	int			  part     = acorn_payload_partition(node->filter_val);
+	int			  p_filled = 0;
+	int			  part_ep;
+	bool		  gate;
+	int			  g_sel[HNSW_MAX_NEIGHBORS];
+	int			  n_global = 0;
+	int			 *out_ids;
+	double		 *out_dists;
+
+	if (p_half <= 0)
+		return;
+	/* P4 gating: tiny partitions keep an empty payload half (scan tolerates -1) */
+	gate = (mb->part_count != NULL && mb->part_count[part] < mb->payload_min_card);
+	if (gate)
+		return;
+
+	/* Snapshot this node's global half (pass 1) so we never re-add it. */
+	acorn_node_lock(mb, node, LW_SHARED);
+	for (int i = 0; i < g_half; i++)
+	{
+		int v = my_nbr[start + i];
+
+		if (v >= 0)
+			g_sel[n_global++] = v;
+	}
+	acorn_node_unlock(mb, node);
+
+	if (sh)
+		LWLockAcquire(&sh->partLock, LW_SHARED);
+	part_ep = mb->part_entry[part];
+	if (sh)
+		LWLockRelease(&sh->partLock);
+
+	out_ids   = palloc(sizeof(int)    * efc);
+	out_dists = palloc(sizeof(double) * efc);
+
+	if (part_ep >= 0)
+	{
+		int    *p_ids   = palloc(sizeof(int) * efc);
+		double *p_dists = palloc(sizeof(double) * efc);
+		int     n_part  = acorn_mem_search_partition(mb, dist, m_eff, part_ep,
+													 q, part, efc, p_ids, p_dists);
+		int     n_avail = 0;
+		int    *p_sel   = palloc(sizeof(int) * p_half);
+		int     n_sel;
+
+		/* drop self + candidates already in the global half */
+		for (int i = 0; i < n_part; i++)
+		{
+			bool dup = (p_ids[i] == id);
+
+			for (int j = 0; !dup && j < n_global; j++)
+				if (g_sel[j] == p_ids[i])
+					dup = true;
+			if (dup)
+				continue;
+			p_ids[n_avail]   = p_ids[i];
+			p_dists[n_avail] = p_dists[i];
+			n_avail++;
+		}
+
+		if (diversify)
+			n_sel = acorn_mem_select_diverse(mb, dist, p_ids, p_dists,
+											 n_avail, p_half, p_sel);
+		else
+		{
+			n_sel = Min(n_avail, p_half);
+			memcpy(p_sel, p_ids, n_sel * sizeof(int));
+		}
+
+		acorn_node_lock(mb, node, LW_EXCLUSIVE);
+		for (int i = 0; i < n_sel; i++)
+			my_nbr[start + g_half + i] = p_sel[i];
+		acorn_node_unlock(mb, node);
+		p_filled = n_sel;
+
+		/* bidirectional: reverse edge into each member's payload half */
+		for (int i = 0; i < n_sel; i++)
+			acorn_mem_add_reverse_edge(mb, dist, p_sel[i], id,
+				HnswNeighborStart(m_eff, mb->nodes[p_sel[i]].level, 0) + g_half,
+				p_half, part, diversify);
+
+		pfree(p_sel);
+		pfree(p_ids);
+		pfree(p_dists);
+	}
+
+	/*
+	 * Graceful degradation: if the partition is too small, fill remaining
+	 * payload slots with the next-best UNUSED global candidates (forward edges
+	 * only).  Re-run the layer-0 beam search from the entry to get them.
+	 */
+	if (p_filled < p_half)
+	{
+		int ep_id, entry_level;
+
+		if (sh)
+		{
+			uint64 e = pg_atomic_read_u64(&sh->entry);
+
+			ep_id       = ACORN_ENTRY_ID(e);
+			entry_level = ACORN_ENTRY_LEVEL(e);
+		}
+		else
+		{
+			ep_id       = mb->entry_id;
+			entry_level = mb->entry_level;
+		}
+
+		if (ep_id >= 0)
+		{
+			int n_cands;
+
+			if (entry_level > 0)
+				acorn_mem_greedy_descend(mb, dist, m_eff, &ep_id, q,
+										 entry_level, 0);
+			n_cands = acorn_mem_search_layer(mb, dist, m_eff, ep_id, q, 0, efc,
+											 out_ids, out_dists);
+
+			acorn_node_lock(mb, node, LW_EXCLUSIVE);
+			for (int i = 0; i < n_cands && p_filled < p_half; i++)
+			{
+				bool used = (out_ids[i] == id);
+
+				for (int j = 0; !used && j < n_global; j++)
+					if (g_sel[j] == out_ids[i])
+						used = true;
+				for (int j = 0; !used && j < p_filled; j++)
+					if (my_nbr[start + g_half + j] == out_ids[i])
+						used = true;
+				if (used)
+					continue;
+				my_nbr[start + g_half + p_filled] = out_ids[i];
+				p_filled++;
+			}
+			acorn_node_unlock(mb, node);
+		}
+	}
+
+	pfree(out_ids);
+	pfree(out_dists);
 }
 
 /* -----------------------------------------------------------------------
@@ -3746,6 +3918,7 @@ acorn_init_build_state(AcornBuildState *bs, Relation heap, Relation index,
 	bs->mb = acorn_mem_build_init(bs->graph_ctx);
 	/* payload edges need a filter column to partition on */
 	bs->mb->payload_edges  = acorn_opt_payload_edges(index) && bs->has_filter;
+	bs->mb->payload_two_pass = acorn_build_payload_two_pass;
 	/* layer-0 payload-half width (= m_eff when symmetric) */
 	bs->mb->payload_m      = acorn_payload_m_eff(index);
 	/* P4: payload gating threshold (0 = off); part_count wired by the caller */
@@ -4270,6 +4443,26 @@ acorn_plan_parallel_workers(Relation heap, Relation index)
 	return max_parallel_maintenance_workers;
 }
 
+/*
+ * Pass 2 driver: add payload edges to every in-memory node after the base graph
+ * is complete (before flush).  No-op unless payload_edges && payload_two_pass.
+ * Runs in the leader (parallel) / sole process (serial); see acorn_build_internal.
+ */
+static void
+acorn_build_payload_pass(AcornBuildState *bs, int m_eff)
+{
+	AcornMemBuild *mb = bs->mb;
+	int			   n_nodes;
+
+	if (mb == NULL || !mb->payload_edges || !mb->payload_two_pass)
+		return;
+
+	n_nodes = mb->shared ? acorn_shared_n_nodes(mb->shared) : mb->n_nodes;
+	for (int id = 0; id < n_nodes; id++)
+		acorn_mem_build_payload_node(mb, &bs->dist, m_eff, bs->efc,
+									 bs->diversify, id);
+}
+
 /* -----------------------------------------------------------------------
  * ambuild / ambuildempty
  * ----------------------------------------------------------------------- */
@@ -4389,6 +4582,9 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 		LWLockAcquire(&bs.shared->flushLock, LW_EXCLUSIVE);
 		if (!bs.shared->flushed)
 		{
+			/* B3: add payload edges over the finished base graph (no-op
+			 * unless two-pass; parallelized across workers in a later step). */
+			acorn_build_payload_pass(&bs, m_eff);
 			acorn_mem_flush(bs.mb, index, forkNum, m_eff);
 			bs.shared->flushed = true;
 		}
@@ -4396,7 +4592,10 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 		acorn_end_parallel(bs.leader);
 	}
 	else if (!bs.flushed)
+	{
+		acorn_build_payload_pass(&bs, m_eff);	/* B3: pass 2 (serial) */
 		acorn_mem_flush(bs.mb, index, forkNum, m_eff);
+	}
 
 	/*
 	 * The build wrote pages without WAL (including any spilled on-disk
