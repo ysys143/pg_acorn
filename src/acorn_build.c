@@ -843,8 +843,8 @@ build_mark_visited(HTAB *visited, const ItemPointerData *tid)
  *   - node-id + arena allocation: lock-free, two atomic fetch-adds
  *     (n_nodes, arena_used); overflow returns -1 and spills, never writing
  *     a half-built node (acorn_mem_push_node)
- *   - entryLock/entryWaitLock: entry point reads (shared) and updates
- *     (exclusive, with the wait-lock dance to avoid starvation)
+ *   - entry point: lock-free atomic word (packed level+id); snapshot read,
+ *     CAS to claim the empty entry / publish a higher-level node
  *   - flushLock:      shared while inserting in memory; exclusive to flush
  *     and for each (serialized) on-disk insert after spill — the acorn
  *     on-disk insert path is NOT concurrency-safe, so correctness over
@@ -905,14 +905,11 @@ typedef struct AcornShared
 	ConditionVariable workersdonecv;
 
 	/* Graph state */
-	LWLock		entryLock;
-	LWLock		entryWaitLock;
 	LWLock		flushLock;
 	LWLock		partLock;
 	pg_atomic_uint32 n_nodes;	/* lock-free bump allocator (node-id counter) */
 	pg_atomic_uint64 arena_used;	/* lock-free bump allocator (arena offset) */
-	int			entry_id;		/* under entryLock; -1 = none */
-	int			entry_level;
+	pg_atomic_uint64 entry;		/* packed (level+1)<<32 | id; 0 = none */
 	bool		flushed;		/* under flushLock */
 	int			part_entry[ACORN_PAYLOAD_PARTITIONS];	/* under partLock */
 	int			part_count[ACORN_PAYLOAD_PARTITIONS];	/* P4: final per-partition
@@ -936,6 +933,25 @@ acorn_shared_n_nodes(AcornShared *sh)
 {
 	uint32 n = pg_atomic_read_u32(&sh->n_nodes);
 	return (n > (uint32) sh->max_nodes) ? sh->max_nodes : (int) n;
+}
+
+/*
+ * Entry point packed into one atomic word: (level+1) in the high 32 bits, the
+ * node id in the low 32 bits.  Empty == 0 (high word 0 => level -1).  Because
+ * real levels are >= 0, "higher level" is a plain high-word comparison and the
+ * empty state naturally compares below every real entry.
+ */
+#define ACORN_ENTRY_PACK(level, id) \
+	((((uint64) (uint32) ((level) + 1)) << 32) | (uint32) (id))
+#define ACORN_ENTRY_LEVEL(p)	((int) (uint32) ((p) >> 32) - 1)	/* -1 = empty */
+#define ACORN_ENTRY_ID(p)		((int) (uint32) (p))
+
+/* Current entry node id, or -1 when the graph is still empty. */
+static inline int
+acorn_shared_entry_id(AcornShared *sh)
+{
+	uint64 e = pg_atomic_read_u64(&sh->entry);
+	return (ACORN_ENTRY_LEVEL(e) < 0) ? -1 : ACORN_ENTRY_ID(e);
 }
 
 typedef struct AcornMemBuild
@@ -1724,10 +1740,11 @@ acorn_mem_register_part_entry(AcornMemBuild *mb, AcornMemNode *node, int new_id)
  * publishes the node to other participants — deferral guarantees the node's
  * own slots are complete before it becomes reachable.
  *
- * Parallel entry-point protocol (mirrors pgvector InsertTupleInMemory):
- * the entry is read under entryLock LW_SHARED held for the whole insert;
- * when this node will (or may) update the entry, the lock is taken
- * LW_EXCLUSIVE instead, with entryWaitLock preventing starvation.
+ * Parallel entry-point protocol: the entry (packed level+id) is read once as a
+ * lock-free atomic snapshot and used only as a descent start point — a stale
+ * read is safe because the entry node is immutable after publication.  A node
+ * that reaches a new max level publishes itself via a CAS-if-higher loop; the
+ * first node claims the empty entry via a single CAS.
  */
 static void
 acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
@@ -1746,27 +1763,13 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 	AcornRevEdge *rev;
 	int			  n_rev = 0;
 
-	/* --- Read the entry point (locked dance in a parallel build) --- */
+	/* --- Read the entry point (lock-free atomic snapshot) --- */
 	if (sh)
 	{
-		LWLockAcquire(&sh->entryWaitLock, LW_EXCLUSIVE);
-		LWLockRelease(&sh->entryWaitLock);
+		uint64 packed = pg_atomic_read_u64(&sh->entry);
 
-		LWLockAcquire(&sh->entryLock, LW_SHARED);
-		entry_id    = sh->entry_id;
-		entry_level = sh->entry_level;
-
-		if (entry_id < 0 || level > entry_level)
-		{
-			LWLockRelease(&sh->entryLock);
-
-			LWLockAcquire(&sh->entryWaitLock, LW_EXCLUSIVE);
-			LWLockAcquire(&sh->entryLock, LW_EXCLUSIVE);
-			LWLockRelease(&sh->entryWaitLock);
-
-			entry_id    = sh->entry_id;
-			entry_level = sh->entry_level;
-		}
+		entry_level = ACORN_ENTRY_LEVEL(packed);
+		entry_id    = (entry_level < 0) ? -1 : ACORN_ENTRY_ID(packed);
 	}
 	else
 	{
@@ -1776,20 +1779,32 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 
 	if (entry_id < 0)
 	{
-		/* First node: it becomes the entry point (exclusive lock held) */
+		/* First node becomes the entry point. */
 		if (sh)
 		{
-			sh->entry_id    = new_id;
-			sh->entry_level = level;
-			LWLockRelease(&sh->entryLock);
+			uint64 expected = 0;	/* empty */
+			uint64 desired  = ACORN_ENTRY_PACK(level, new_id);
+
+			if (pg_atomic_compare_exchange_u64(&sh->entry, &expected, desired))
+			{
+				acorn_mem_register_part_entry(mb, node, new_id);
+				return;
+			}
+			/*
+			 * Lost the race: another node published the entry; the CAS loaded
+			 * its packed value into `expected`.  Fall through and insert
+			 * normally against it.
+			 */
+			entry_level = ACORN_ENTRY_LEVEL(expected);
+			entry_id    = ACORN_ENTRY_ID(expected);
 		}
 		else
 		{
 			mb->entry_id    = new_id;
 			mb->entry_level = level;
+			acorn_mem_register_part_entry(mb, node, new_id);
+			return;
 		}
-		acorn_mem_register_part_entry(mb, node, new_id);
-		return;
 	}
 
 	ep_id = entry_id;
@@ -1996,11 +2011,18 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 
 	if (level > entry_level)
 	{
-		/* exclusive entryLock held in a parallel build (taken above) */
 		if (sh)
 		{
-			sh->entry_id    = new_id;
-			sh->entry_level = level;
+			uint64 desired = ACORN_ENTRY_PACK(level, new_id);
+			uint64 cur     = pg_atomic_read_u64(&sh->entry);
+
+			/* Publish iff our level is strictly higher than the live entry. */
+			while (level > ACORN_ENTRY_LEVEL(cur))
+			{
+				if (pg_atomic_compare_exchange_u64(&sh->entry, &cur, desired))
+					break;
+				/* cur reloaded with the live value; re-check the guard. */
+			}
 		}
 		else
 		{
@@ -2008,8 +2030,6 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 			mb->entry_level = level;
 		}
 	}
-	if (sh)
-		LWLockRelease(&sh->entryLock);
 
 	acorn_mem_register_part_entry(mb, node, new_id);
 }
@@ -2293,7 +2313,7 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 	BlockNumber  blkno_out;
 	OffsetNumber off_out;
 	int			 n_nodes  = mb->shared ? acorn_shared_n_nodes(mb->shared) : mb->n_nodes;
-	int			 entry_id = mb->shared ? mb->shared->entry_id : mb->entry_id;
+	int			 entry_id = mb->shared ? acorn_shared_entry_id(mb->shared) : mb->entry_id;
 
 	if (n_nodes == 0)
 		return;
@@ -4168,11 +4188,8 @@ acorn_begin_parallel(AcornBuildState *bs, bool isconcurrent, int request,
 	pg_atomic_init_u32(&shared->n_nodes, 0);
 	pg_atomic_init_u64(&shared->arena_used,
 					   (uint64) MAXALIGN((Size) max_nodes * sizeof(AcornMemNode)));
-	shared->entry_id    = -1;
-	shared->entry_level = -1;
+	pg_atomic_init_u64(&shared->entry, 0);
 	shared->flushed     = false;
-	LWLockInitialize(&shared->entryLock, acorn_lock_tranche_id);
-	LWLockInitialize(&shared->entryWaitLock, acorn_lock_tranche_id);
 	LWLockInitialize(&shared->flushLock, acorn_lock_tranche_id);
 	LWLockInitialize(&shared->partLock, acorn_lock_tranche_id);
 	for (int p = 0; p < ACORN_PAYLOAD_PARTITIONS; p++)

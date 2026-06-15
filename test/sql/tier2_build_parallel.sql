@@ -180,4 +180,36 @@ FROM (SELECT bucket FROM items WHERE bucket < 5
 RESET enable_seqscan;
 RESET pg_acorn.ef_search;
 
+-- Entry-CAS stress: a low m (=4) makes acorn_assign_level draw higher levels
+-- frequently, so many nodes race to publish themselves as the entry point
+-- (lock-free CAS-if-higher).  The parallel (4-worker) build must still reach
+-- recall parity with a serial m=4 twin — a broken entry CAS would corrupt
+-- descent start points and tank recall.
+DROP INDEX items_stress_idx;
+DROP INDEX items_ser_idx;
+SET pg_acorn.build_seed = 42;
+SET max_parallel_maintenance_workers = 4;
+SET maintenance_work_mem = '8MB';
+CREATE INDEX items_m4_idx ON items
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 4, ef_construction = 64, acorn_gamma = 2, acorn_inline_vectors = true);
+SET max_parallel_maintenance_workers = 0;
+CREATE INDEX items_ser_m4_idx ON items_ser
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 4, ef_construction = 64, acorn_gamma = 2, acorn_inline_vectors = true);
+RESET max_parallel_maintenance_workers;
+RESET maintenance_work_mem;
+RESET pg_acorn.build_seed;
+
+SELECT abs(acorn_recall('items', 400) - acorn_recall('items_ser', 400)) <= 0.2
+    AS entry_stress_recall_parity_ef400;
+
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 400;
+SELECT count(*) = 10 AS entry_stress_returns_k
+FROM (SELECT id FROM items WHERE bucket < 1
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+RESET enable_seqscan;
+RESET pg_acorn.ef_search;
+
 DROP SCHEMA test_tier2_par CASCADE;
