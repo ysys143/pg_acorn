@@ -42,6 +42,7 @@
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
+#include "port/atomics.h"
 #include "utils/snapmgr.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
@@ -839,7 +840,9 @@ build_mark_visited(HTAB *visited, const ItemPointerData *tid)
  * pgvector's relptr pattern).  Concurrency control mirrors pgvector
  * hnswbuild.c:
  *
- *   - allocatorLock:  node-id + arena bump allocation
+ *   - node-id + arena allocation: lock-free, two atomic fetch-adds
+ *     (n_nodes, arena_used); overflow returns -1 and spills, never writing
+ *     a half-built node (acorn_mem_push_node)
  *   - entryLock/entryWaitLock: entry point reads (shared) and updates
  *     (exclusive, with the wait-lock dance to avoid starvation)
  *   - flushLock:      shared while inserting in memory; exclusive to flush
@@ -902,13 +905,12 @@ typedef struct AcornShared
 	ConditionVariable workersdonecv;
 
 	/* Graph state */
-	LWLock		allocatorLock;
 	LWLock		entryLock;
 	LWLock		entryWaitLock;
 	LWLock		flushLock;
 	LWLock		partLock;
-	int			n_nodes;		/* under allocatorLock */
-	Size		arena_used;		/* bump offset, under allocatorLock */
+	pg_atomic_uint32 n_nodes;	/* lock-free bump allocator (node-id counter) */
+	pg_atomic_uint64 arena_used;	/* lock-free bump allocator (arena offset) */
 	int			entry_id;		/* under entryLock; -1 = none */
 	int			entry_level;
 	bool		flushed;		/* under flushLock */
@@ -922,6 +924,19 @@ typedef struct AcornShared
 
 #define ParallelTableScanFromAcornShared(shared) \
 	((ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(AcornShared))))
+
+/*
+ * Published node count, clamped to the node-array capacity.  The lock-free
+ * bump allocator (acorn_mem_push_node) may transiently advance n_nodes past
+ * max_nodes when workers race at capacity (those ids are never written), so
+ * every post-barrier reader must clamp before iterating mb->nodes[].
+ */
+static inline int
+acorn_shared_n_nodes(AcornShared *sh)
+{
+	uint32 n = pg_atomic_read_u32(&sh->n_nodes);
+	return (n > (uint32) sh->max_nodes) ? sh->max_nodes : (int) n;
+}
 
 typedef struct AcornMemBuild
 {
@@ -1085,21 +1100,30 @@ acorn_mem_push_node(AcornMemBuild *mb, Datum vec, Size vsize, int level,
 		Size		 vbytes = MAXALIGN(vsize);
 		Size		 nbytes = MAXALIGN((Size) n_slots * sizeof(int));
 
-		LWLockAcquire(&sh->allocatorLock, LW_EXCLUSIVE);
-		if (sh->n_nodes >= sh->max_nodes ||
-			sh->arena_used + vbytes + nbytes > sh->arena_size)
-		{
-			LWLockRelease(&sh->allocatorLock);
+		uint64		 base;
+		uint32		 newid;
+
+		/*
+		 * Lock-free bump allocator (replaces the per-node allocatorLock).
+		 * Reserve arena bytes FIRST, then a node id: on either overflow we
+		 * return -1 WITHOUT writing mb->nodes[], so no half-built node can
+		 * ever be reached.  A racing overflow may leave arena_used/n_nodes
+		 * transiently inflated — benign: it only makes later pushes spill
+		 * sooner, and post-barrier readers clamp via acorn_shared_n_nodes().
+		 */
+		base = pg_atomic_fetch_add_u64(&sh->arena_used,
+									   (uint64) (vbytes + nbytes));
+		if (base + vbytes + nbytes > (uint64) sh->arena_size)
 			return -1;
-		}
-		id = sh->n_nodes++;
+		newid = pg_atomic_fetch_add_u32(&sh->n_nodes, 1);
+		if (newid >= (uint32) sh->max_nodes)
+			return -1;
+
+		id   = (int) newid;
 		node = &mb->nodes[id];
 		MemSet(node, 0, sizeof(AcornMemNode));
-		node->vec.off = sh->arena_used;
-		sh->arena_used += vbytes;
-		node->nbr.off = sh->arena_used;
-		sh->arena_used += nbytes;
-		LWLockRelease(&sh->allocatorLock);
+		node->vec.off = (Size) base;
+		node->nbr.off = (Size) (base + vbytes);
 
 		LWLockInitialize(&node->lock, acorn_lock_tranche_id);
 		vdst = mb->base + node->vec.off;
@@ -2268,7 +2292,7 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 {
 	BlockNumber  blkno_out;
 	OffsetNumber off_out;
-	int			 n_nodes  = mb->shared ? mb->shared->n_nodes : mb->n_nodes;
+	int			 n_nodes  = mb->shared ? acorn_shared_n_nodes(mb->shared) : mb->n_nodes;
 	int			 entry_id = mb->shared ? mb->shared->entry_id : mb->entry_id;
 
 	if (n_nodes == 0)
@@ -3811,7 +3835,9 @@ acorn_build_insert_tuple(AcornBuildState *bs, Datum value, Size vsize,
 			indtuples = sh->indtuples;
 			SpinLockRelease(&sh->mutex);
 
-			acorn_build_mwm_warning(indtuples, sh->arena_used, sh->arena_size);
+			acorn_build_mwm_warning(indtuples,
+									pg_atomic_read_u64(&sh->arena_used),
+									sh->arena_size);
 			acorn_mem_flush(mb, bs->index, bs->forkNum, bs->m_eff);
 			sh->flushed = true;
 		}
@@ -4139,12 +4165,12 @@ acorn_begin_parallel(AcornBuildState *bs, bool isconcurrent, int request,
 	max_nodes = acorn_estimate_max_nodes(bs->index, shared->arena_size,
 										 bs->m_eff);
 	shared->max_nodes   = max_nodes;
-	shared->n_nodes     = 0;
-	shared->arena_used  = MAXALIGN((Size) max_nodes * sizeof(AcornMemNode));
+	pg_atomic_init_u32(&shared->n_nodes, 0);
+	pg_atomic_init_u64(&shared->arena_used,
+					   (uint64) MAXALIGN((Size) max_nodes * sizeof(AcornMemNode)));
 	shared->entry_id    = -1;
 	shared->entry_level = -1;
 	shared->flushed     = false;
-	LWLockInitialize(&shared->allocatorLock, acorn_lock_tranche_id);
 	LWLockInitialize(&shared->entryLock, acorn_lock_tranche_id);
 	LWLockInitialize(&shared->entryWaitLock, acorn_lock_tranche_id);
 	LWLockInitialize(&shared->flushLock, acorn_lock_tranche_id);

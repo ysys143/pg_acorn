@@ -150,4 +150,34 @@ FROM (SELECT bucket FROM items WHERE bucket < 5
 RESET enable_seqscan;
 RESET pg_acorn.ef_search;
 
+-- High-contention atomic-allocator stress: 4 workers race the lock-free bump
+-- allocator (n_nodes + arena_used fetch-adds) at a tiny shared arena, forcing
+-- node-id / arena overflow under contention.  The parallel-built index must
+-- still reach recall parity with the serial twin and return k results — proving
+-- the atomic path leaks no ids and never overlaps the arena.
+DROP INDEX items_parspill_idx;
+ALTER TABLE items SET (parallel_workers = 4);
+SET max_parallel_maintenance_workers = 4;
+SET maintenance_work_mem = '1MB';
+SET client_min_messages = error;
+CREATE INDEX items_stress_idx ON items
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+          acorn_inline_vectors = true);
+RESET client_min_messages;
+RESET maintenance_work_mem;
+RESET max_parallel_maintenance_workers;
+
+SELECT abs(acorn_recall('items', 400) - acorn_recall('items_ser', 400)) <= 0.2
+    AS stress_recall_parity_ef400;
+
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 400;
+SELECT bool_and(bucket < 5) AS stress_filter_correct,
+       count(*) = 10        AS stress_returns_k
+FROM (SELECT bucket FROM items WHERE bucket < 5
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+RESET enable_seqscan;
+RESET pg_acorn.ef_search;
+
 DROP SCHEMA test_tier2_par CASCADE;
