@@ -105,4 +105,39 @@ SELECT acorn_recall('items_on', 'bucket < 5', 'truth_range', 400)
      >= acorn_recall('items_off', 'bucket < 5', 'truth_range', 400) - 0.02 AS tp_range_ge_ef400;
 RESET pg_acorn.ef_search;
 
+-- Concurrency: the two-pass payload pass runs across parallel workers
+-- (work-stealing) after a pass-1 barrier.  A race on payload writes / reverse
+-- edges, or a barrier deadlock, would show up as recall collapse (or a hang)
+-- vs the serial two-pass twin (items_on).  4 workers on a small table.
+CREATE TABLE items_par AS SELECT * FROM items_off;
+ALTER TABLE items_par SET (parallel_workers = 4);
+SET max_parallel_maintenance_workers = 4;
+-- Small arena keeps the parallel-build DSM within the container's /dev/shm
+-- (the 2000 dim-8 rows fit in memory; mirrors tier2_build_parallel).
+SET maintenance_work_mem = '8MB';
+SET pg_acorn.build_payload_two_pass = on;
+CREATE INDEX items_par_idx ON items_par
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+          acorn_payload_edges = true, acorn_payload_m = 64, acorn_diversify = false);
+RESET pg_acorn.build_payload_two_pass;
+RESET max_parallel_maintenance_workers;
+RESET maintenance_work_mem;
+
+-- parallel two-pass recall within 0.2 of the serial two-pass index
+SELECT abs(acorn_recall('items_par', 'bucket = 0', 'truth_eq', 400)
+         - acorn_recall('items_on', 'bucket = 0', 'truth_eq', 400)) <= 0.2
+    AS par_tp_eq_parity_ef400;
+SELECT abs(acorn_recall('items_par', 'bucket < 5', 'truth_range', 400)
+         - acorn_recall('items_on', 'bucket < 5', 'truth_range', 400)) <= 0.2
+    AS par_tp_range_parity_ef400;
+
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 400;
+SELECT bool_and(bucket = 0) AS par_tp_filter_correct, count(*) = 10 AS par_tp_returns_k
+FROM (SELECT bucket FROM items_par WHERE bucket = 0
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+RESET enable_seqscan;
+RESET pg_acorn.ef_search;
+
 DROP SCHEMA test_t2_2pass CASCADE;

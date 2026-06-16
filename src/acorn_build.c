@@ -899,7 +899,10 @@ typedef struct AcornShared
 
 	/* Worker progress (under mutex) */
 	slock_t		mutex;
-	int			nparticipantsdone;
+	int			nparticipants;		/* total participants (workers + leader) */
+	int			nparticipantsdone;	/* finished pass 1 (base graph) */
+	int			pass2done;			/* finished pass 2 (B3 two-pass payload) */
+	pg_atomic_uint32 pass2_next;	/* B3: work-stealing cursor for pass 2 */
 	double		reltuples;
 	double		indtuples;
 	ConditionVariable workersdonecv;
@@ -4153,8 +4156,55 @@ acorn_parallel_scan_and_insert(Relation heap, Relation index,
 			(errmsg("acorn_hnsw %s processed %.0f tuples",
 					progress ? "leader" : "worker", reltuples)));
 
-	/* Notify leader */
+	/* Notify leader (pass 1 done) */
 	ConditionVariableSignal(&shared->workersdonecv);
+
+	/*
+	 * B3 two-pass payload edges: once EVERY participant has finished pass 1
+	 * (base graph + part_entry[] complete), add the payload half to every node
+	 * over the finished graph, distributed by atomic work-stealing.  No-op
+	 * unless two-pass; the work is skipped (leaving global-only halves) if the
+	 * build spilled to disk, but pass2done is still signalled so the leader's
+	 * barrier stays consistent.
+	 */
+	if (bs.mb->payload_edges && bs.mb->payload_two_pass)
+	{
+		/* Barrier: wait for all participants' pass 1 to complete. */
+		for (;;)
+		{
+			int done;
+
+			SpinLockAcquire(&shared->mutex);
+			done = shared->nparticipantsdone;
+			SpinLockRelease(&shared->mutex);
+			if (done >= shared->nparticipants)
+				break;
+			ConditionVariableSleep(&shared->workersdonecv,
+								   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+		}
+		ConditionVariableCancelSleep();
+
+		if (!shared->flushed)
+		{
+			int n_nodes = acorn_shared_n_nodes(shared);
+
+			for (;;)
+			{
+				uint32 id = pg_atomic_fetch_add_u32(&shared->pass2_next, 1);
+
+				if (id >= (uint32) n_nodes)
+					break;
+				acorn_mem_build_payload_node(bs.mb, &bs.dist, bs.m_eff, bs.efc,
+											 bs.diversify, (int) id);
+			}
+		}
+
+		/* Pass 2 done: the leader waits on this before flushing. */
+		SpinLockAcquire(&shared->mutex);
+		shared->pass2done++;
+		SpinLockRelease(&shared->mutex);
+		ConditionVariableSignal(&shared->workersdonecv);
+	}
 
 	if (bs.graph_ctx)
 		MemoryContextDelete(bs.graph_ctx);
@@ -4225,11 +4275,16 @@ acorn_parallel_heapscan(AcornBuildState *bs)
 	AcornShared *shared = bs->leader->shared;
 	int			 nparticipants = bs->leader->nparticipants;
 	double		 reltuples;
+	/* Two-pass build adds a payload pass after the scan; wait for THAT too. */
+	bool		 two_pass = bs->mb->payload_edges && bs->mb->payload_two_pass;
 
 	for (;;)
 	{
+		int done;
+
 		SpinLockAcquire(&shared->mutex);
-		if (shared->nparticipantsdone == nparticipants)
+		done = two_pass ? shared->pass2done : shared->nparticipantsdone;
+		if (done == nparticipants)
 		{
 			bs->indtuples = shared->indtuples;
 			reltuples = shared->reltuples;
@@ -4346,6 +4401,8 @@ acorn_begin_parallel(AcornBuildState *bs, bool isconcurrent, int request,
 	ConditionVariableInit(&shared->workersdonecv);
 	SpinLockInit(&shared->mutex);
 	shared->nparticipantsdone = 0;
+	shared->pass2done = 0;
+	pg_atomic_init_u32(&shared->pass2_next, 0);
 	shared->reltuples = 0;
 	shared->indtuples = 0;
 	table_parallelscan_initialize(bs->heap,
@@ -4392,6 +4449,7 @@ acorn_begin_parallel(AcornBuildState *bs, bool isconcurrent, int request,
 	leader->nparticipants = pcxt->nworkers_launched;
 	if (leaderparticipates)
 		leader->nparticipants++;
+	shared->nparticipants = leader->nparticipants;	/* B3: pass-1/2 barriers */
 	leader->shared   = shared;
 	leader->snapshot = snapshot;
 	leader->area     = area;
@@ -4410,13 +4468,17 @@ acorn_begin_parallel(AcornBuildState *bs, bool isconcurrent, int request,
 	/* Save leader state now that it's clear build will be parallel */
 	bs->leader = leader;
 
+	/*
+	 * Wait for all launched workers to attach before the leader joins the
+	 * scan.  The two-pass build has the leader wait on the pass-1 barrier
+	 * inside scan_and_insert, so workers must be accounted for first.
+	 */
+	WaitForParallelWorkersToAttach(pcxt);
+
 	/* Join heap scan ourselves */
 	if (leaderparticipates)
 		acorn_parallel_scan_and_insert(bs->heap, bs->index, shared, area,
 									   true);
-
-	/* Wait for all launched workers */
-	WaitForParallelWorkersToAttach(pcxt);
 }
 
 /*
@@ -4582,9 +4644,9 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 		LWLockAcquire(&bs.shared->flushLock, LW_EXCLUSIVE);
 		if (!bs.shared->flushed)
 		{
-			/* B3: add payload edges over the finished base graph (no-op
-			 * unless two-pass; parallelized across workers in a later step). */
-			acorn_build_payload_pass(&bs, m_eff);
+			/* B3 two-pass payload edges were already added by the participants
+			 * (leader + workers) in acorn_parallel_scan_and_insert before this
+			 * barrier; nothing left to do here but flush. */
 			acorn_mem_flush(bs.mb, index, forkNum, m_eff);
 			bs.shared->flushed = true;
 		}
@@ -4593,7 +4655,7 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 	}
 	else if (!bs.flushed)
 	{
-		acorn_build_payload_pass(&bs, m_eff);	/* B3: pass 2 (serial) */
+		acorn_build_payload_pass(&bs, m_eff);	/* B3: pass 2 (serial build) */
 		acorn_mem_flush(bs.mb, index, forkNum, m_eff);
 	}
 
