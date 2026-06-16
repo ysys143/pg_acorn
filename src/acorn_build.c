@@ -72,19 +72,6 @@
  */
 #define ACORN_MAX_LEVEL  6
 
-/*
- * N1 batch reservation (parallel build): each worker reserves ACORN_ID_BATCH
- * node-ids and an arena byte batch with ONE atomic fetch-add each, then
- * allocates locally (vs the per-node global fetch-adds whose cache-line
- * bouncing at high core counts regressed the build).  Reserved-but-unwritten
- * ids (the partial last batch) are left as ACORN_NODE_DEAD sentinels in
- * AcornMemNode.level and skipped by every post-barrier node iterator.
- */
-#define ACORN_NODE_DEAD          (-1)	/* level sentinel: unfilled reserved slot */
-#define ACORN_ID_BATCH           256	/* node-ids reserved per fetch-add */
-#define ACORN_ARENA_BATCH_NODES  256	/* arena byte batch = this * per-node estimate */
-#define ACORN_BATCH_LEVEL_CAP    3		/* conservative level for the byte estimate */
-
 /* shm_toc keys for the parallel build (mirrors pgvector hnswbuild.c) */
 #define PARALLEL_KEY_ACORN_SHARED	UINT64CONST(0xB000000000000001)
 #define PARALLEL_KEY_ACORN_AREA		UINT64CONST(0xB000000000000002)
@@ -1005,11 +992,6 @@ typedef struct AcornMemBuild
 	/* maintenance_work_mem accounting (serial; parallel uses the arena) */
 	Size			mem_used;		/* bytes allocated for the graph so far */
 	Size			mem_total;		/* budget = maintenance_work_mem in bytes */
-	/* N1: per-worker BATCH reservation cursors (parallel build only) */
-	uint32			id_next;		/* next free reserved node-id */
-	uint32			id_end;			/* one past the last reserved node-id */
-	uint64			arena_next;		/* next free reserved arena byte offset */
-	uint64			arena_end;		/* one past the last reserved arena byte */
 } AcornMemBuild;
 
 /* Graph-internal pointer access (relptr pattern; see block comment above) */
@@ -1147,60 +1129,30 @@ acorn_mem_push_node(AcornMemBuild *mb, Datum vec, Size vsize, int level,
 		Size		 vbytes = MAXALIGN(vsize);
 		Size		 nbytes = MAXALIGN((Size) n_slots * sizeof(int));
 
-		Size		 need = vbytes + nbytes;
-		uint64		 nbase;
+		uint64		 base;
 		uint32		 newid;
 
 		/*
-		 * Per-worker BATCH reservation (replaces the per-node global fetch-adds,
-		 * whose cache-line bouncing on n_nodes/arena_used at high core counts
-		 * regressed the build).  Reserve a batch of ids and a batch of arena
-		 * bytes with ONE fetch-add each, then allocate locally; refill when a
-		 * batch runs out.  On either overflow return -1 WITHOUT writing
-		 * mb->nodes[].  Reserved-but-unwritten ids (the partial last batch, or
-		 * the tail after a spill) stay ACORN_NODE_DEAD and are skipped by every
-		 * post-barrier node iterator; post-barrier readers clamp via
-		 * acorn_shared_n_nodes().
+		 * Lock-free bump allocator (replaces the per-node allocatorLock).
+		 * Reserve arena bytes FIRST, then a node id: on either overflow we
+		 * return -1 WITHOUT writing mb->nodes[], so no half-built node can
+		 * ever be reached.  A racing overflow may leave arena_used/n_nodes
+		 * transiently inflated — benign: it only makes later pushes spill
+		 * sooner, and post-barrier readers clamp via acorn_shared_n_nodes().
 		 */
-		if (mb->id_next >= mb->id_end)
-		{
-			uint32 b = pg_atomic_fetch_add_u32(&sh->n_nodes, ACORN_ID_BATCH);
-
-			mb->id_next = b;
-			mb->id_end  = b + ACORN_ID_BATCH;
-		}
-		if (mb->id_next >= (uint32) sh->max_nodes)
-			return -1;				/* node array full: spill */
-
-		if (mb->arena_next + need > mb->arena_end)
-		{
-			/* conservative per-node estimate: this vector + neighbors at a
-			 * capped level (most nodes are level 0; deep nodes just refill). */
-			Size est = vbytes +
-				MAXALIGN((Size) acorn_t2_total_slots(ACORN_BATCH_LEVEL_CAP,
-													 m_eff, mb->payload_m)
-						 * sizeof(int));
-			Size batch = (Size) ACORN_ARENA_BATCH_NODES * est;
-			uint64 b;
-
-			if (batch < need)		/* never under-reserve a single node */
-				batch = need;
-			b = pg_atomic_fetch_add_u64(&sh->arena_used, (uint64) batch);
-			mb->arena_next = b;
-			mb->arena_end  = b + batch;
-		}
-		if (mb->arena_next + need > (uint64) sh->arena_size)
-			return -1;				/* arena full: spill */
-
-		newid = mb->id_next++;
-		nbase = mb->arena_next;
-		mb->arena_next += need;
+		base = pg_atomic_fetch_add_u64(&sh->arena_used,
+									   (uint64) (vbytes + nbytes));
+		if (base + vbytes + nbytes > (uint64) sh->arena_size)
+			return -1;
+		newid = pg_atomic_fetch_add_u32(&sh->n_nodes, 1);
+		if (newid >= (uint32) sh->max_nodes)
+			return -1;
 
 		id   = (int) newid;
 		node = &mb->nodes[id];
 		MemSet(node, 0, sizeof(AcornMemNode));
-		node->vec.off = (Size) nbase;
-		node->nbr.off = (Size) (nbase + vbytes);
+		node->vec.off = (Size) base;
+		node->nbr.off = (Size) (base + vbytes);
 
 		LWLockInitialize(&node->lock, acorn_lock_tranche_id);
 		vdst = mb->base + node->vec.off;
@@ -2159,8 +2111,6 @@ acorn_mem_build_payload_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 	int			 *out_ids;
 	double		 *out_dists;
 
-	if (level == ACORN_NODE_DEAD)
-		return;					/* N1: batch-reserved hole (defense-in-depth) */
 	if (p_half <= 0)
 		return;
 	/* P4 gating: tiny partitions keep an empty payload half (scan tolerates -1) */
@@ -2370,8 +2320,6 @@ acorn_mem_preassign_tids(AcornMemBuild *mb, int m_eff)
 		AcornMemNode *node = &mb->nodes[i];
 		Size          ntup_sz;
 
-		if (node->level == ACORN_NODE_DEAD)
-			continue;			/* N1: skip batch-reserved holes */
 		if (mb->inline_vectors)
 		{
 			int		layer0_n = acorn_t2_l0_width(m_eff, mb->payload_m);
@@ -2426,11 +2374,7 @@ acorn_mem_preassign_tids(AcornMemBuild *mb, int m_eff)
 	for (int i = 0; i < mb->n_nodes; i++)
 	{
 		AcornMemNode *node    = &mb->nodes[i];
-		Size          etup_sz;
-
-		if (node->level == ACORN_NODE_DEAD)
-			continue;			/* N1: skip batch-reserved holes */
-		etup_sz = ACORN_T2_ELEMENT_TUPLE_SIZE(node->vsize);
+		Size          etup_sz = ACORN_T2_ELEMENT_TUPLE_SIZE(node->vsize);
 
 		if (!sim_page_fits(&sp, etup_sz))
 			sim_page_advance(&sp);
@@ -2597,8 +2541,6 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 	/* Pass 1: write all neighbor tuples */
 	for (int i = 0; i < n_nodes; i++)
 	{
-		if (mb->nodes[i].level == ACORN_NODE_DEAD)
-			continue;			/* N1: skip batch-reserved holes */
 		if (mb->inline_vectors)
 		{
 			acorn_mem_flush_inline_node(mb, index, forkNum, m_eff, i);
@@ -2627,14 +2569,9 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 	/* Pass 2: write all element tuples */
 	for (int i = 0; i < n_nodes; i++)
 	{
-		AcornMemNode       *node = &mb->nodes[i];
-		Size                etup_sz;
-		AcornT2ElementTuple etup;
-
-		if (node->level == ACORN_NODE_DEAD)
-			continue;			/* N1: skip batch-reserved holes */
-		etup_sz = ACORN_T2_ELEMENT_TUPLE_SIZE(node->vsize);
-		etup    = palloc0(etup_sz);
+		AcornMemNode       *node    = &mb->nodes[i];
+		Size                etup_sz = ACORN_T2_ELEMENT_TUPLE_SIZE(node->vsize);
+		AcornT2ElementTuple etup    = palloc0(etup_sz);
 
 		etup->type    = HNSW_ELEMENT_TUPLE_TYPE;
 		etup->level   = (uint8) node->level;
@@ -2656,12 +2593,8 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 	/* Pass 3: patch neighbor TID slots with element TIDs */
 	for (int i = 0; i < n_nodes; i++)
 	{
-		AcornMemNode *node = &mb->nodes[i];
-		int			 *my_nbr;
-
-		if (node->level == ACORN_NODE_DEAD)
-			continue;			/* N1: skip batch-reserved holes */
-		my_nbr = acorn_node_nbr(mb, node);
+		AcornMemNode *node   = &mb->nodes[i];
+		int			 *my_nbr = acorn_node_nbr(mb, node);
 
 		for (int lc = node->level; lc >= 0; lc--)
 		{
@@ -4310,8 +4243,6 @@ acorn_parallel_scan_and_insert(Relation heap, Relation index,
 
 				if (id >= (uint32) n_nodes)
 					break;
-				if (bs.mb->nodes[id].level == ACORN_NODE_DEAD)
-					continue;	/* N1: skip batch-reserved holes */
 				acorn_mem_build_payload_node(bs.mb, &bs.dist, bs.m_eff, bs.efc,
 											 bs.diversify, (int) id);
 			}
@@ -4538,18 +4469,6 @@ acorn_begin_parallel(AcornBuildState *bs, bool isconcurrent, int request,
 	pg_atomic_init_u64(&shared->arena_used,
 					   (uint64) MAXALIGN((Size) max_nodes * sizeof(AcornMemNode)));
 	pg_atomic_init_u64(&shared->entry, 0);
-	/*
-	 * N1: stamp every node-array slot DEAD.  Batch reservation advances n_nodes
-	 * past the count actually written (partial last batch / post-spill tail), so
-	 * post-barrier iterators must skip these holes.  push_node overwrites level
-	 * with the real (>= 0) level on the success path; unwritten slots keep DEAD.
-	 */
-	{
-		AcornMemNode *narr = (AcornMemNode *) area;
-
-		for (int i = 0; i < max_nodes; i++)
-			narr[i].level = ACORN_NODE_DEAD;
-	}
 	shared->flushed     = false;
 	LWLockInitialize(&shared->flushLock, acorn_lock_tranche_id);
 	LWLockInitialize(&shared->partLock, acorn_lock_tranche_id);
@@ -4652,12 +4571,8 @@ acorn_build_payload_pass(AcornBuildState *bs, int m_eff)
 
 	n_nodes = mb->shared ? acorn_shared_n_nodes(mb->shared) : mb->n_nodes;
 	for (int id = 0; id < n_nodes; id++)
-	{
-		if (mb->nodes[id].level == ACORN_NODE_DEAD)
-			continue;			/* N1: skip batch-reserved holes */
 		acorn_mem_build_payload_node(mb, &bs->dist, m_eff, bs->efc,
 									 bs->diversify, id);
-	}
 }
 
 /* -----------------------------------------------------------------------
