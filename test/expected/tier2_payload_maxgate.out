@@ -1,0 +1,180 @@
+-- tier2_payload_maxgate.sql: N2 max-cardinality gate + pass-2 visit cap.
+--
+-- acorn_payload_max_cardinality (reloption): skip payload edges for a node whose
+-- filter-value partition has MORE than this many members -> the payload half
+-- stays global-only.  Huge, non-selective partitions are served well by the
+-- global HNSW graph, and their partition search dominates two-pass build time,
+-- so payload edges add little.  pg_acorn.build_payload_visit_cap (GUC) bounds the
+-- per-node partition search so a huge partition cannot serialize pass 2.
+--
+-- Fixture: SKEWED — bucket 0 holds ~80% of rows (the "huge non-selective"
+-- partition), the rest are small (~12 each, the middle band where payload edges
+-- help).  Identical data in items_nogate / items_maxgate isolates the gate.
+\set ON_ERROR_STOP on
+\set q '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'
+CREATE SCHEMA test_t2_maxgate;
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+NOTICE:  extension "pg_acorn" already exists, skipping
+SET search_path = test_t2_maxgate, public;
+SELECT setseed(0.42);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE items_nogate (id serial PRIMARY KEY, bucket int, embedding vector(8));
+INSERT INTO items_nogate (bucket, embedding)
+SELECT (CASE WHEN i <= 2400 THEN 0 ELSE (i % 50) END),  -- bucket 0 ~= 80% (huge)
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 3000) i;
+CREATE TABLE items_maxgate AS SELECT * FROM items_nogate;
+-- exact ground truth (seqscan) for the huge and a small partition
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TABLE truth_huge AS SELECT id FROM items_nogate WHERE bucket = 0
+    ORDER BY embedding <=> :'q'::vector LIMIT 10;
+CREATE TABLE truth_small AS SELECT id FROM items_nogate WHERE bucket = 5
+    ORDER BY embedding <=> :'q'::vector LIMIT 10;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+-- Build both two-pass, serial + build_seed=42 (deterministic); items_maxgate
+-- gates partitions > 500 (so bucket 0 ~2400 IS gated; small ~12 are NOT).
+SET max_parallel_maintenance_workers = 0;
+SET pg_acorn.build_seed = 42;
+SET pg_acorn.build_payload_two_pass = on;
+CREATE INDEX items_nogate_idx ON items_nogate
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+          acorn_payload_edges = true, acorn_payload_m = 64, acorn_diversify = false);
+CREATE INDEX items_maxgate_idx ON items_maxgate
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+          acorn_payload_edges = true, acorn_payload_m = 64, acorn_diversify = false,
+          acorn_payload_max_cardinality = 500);
+RESET pg_acorn.build_payload_two_pass;
+RESET pg_acorn.build_seed;
+RESET max_parallel_maintenance_workers;
+CREATE OR REPLACE FUNCTION acorn_recall(tbl text, qual text, truth_tbl text, ef int)
+RETURNS numeric AS $$
+DECLARE
+    matched int;
+BEGIN
+    EXECUTE format('SET pg_acorn.ef_search = %s', ef);
+    SET enable_seqscan = off;
+    EXECUTE format(
+        'WITH r AS (SELECT id FROM %I WHERE %s
+                    ORDER BY embedding <=> ''[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]''::vector
+                    LIMIT 10)
+         SELECT count(*) FROM r JOIN %I t USING (id)', tbl, qual, truth_tbl)
+        INTO matched;
+    RESET enable_seqscan;
+    RETURN matched / 10.0;
+END;
+$$ LANGUAGE plpgsql;
+-- top-10 id list for a table/qual at a given ef (to compare graphs)
+CREATE OR REPLACE FUNCTION acorn_top(tbl text, qual text, ef int)
+RETURNS int[] AS $$
+DECLARE
+    r int[];
+BEGIN
+    EXECUTE format('SET pg_acorn.ef_search = %s', ef);
+    SET enable_seqscan = off;
+    EXECUTE format(
+        'SELECT array_agg(id ORDER BY embedding <=> ''[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]''::vector)
+         FROM (SELECT id, embedding FROM %I WHERE %s
+               ORDER BY embedding <=> ''[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]''::vector
+               LIMIT 10) s', tbl, qual)
+        INTO r;
+    RESET enable_seqscan;
+    RETURN r;
+END;
+$$ LANGUAGE plpgsql;
+-- (a) gating the huge partition must not break filter correctness / k
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 400;
+SELECT bool_and(bucket = 0) AS maxgate_filter_correct, count(*) = 10 AS maxgate_returns_k
+FROM (SELECT bucket FROM items_maxgate WHERE bucket = 0
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+ maxgate_filter_correct | maxgate_returns_k 
+------------------------+-------------------
+ t                      | t
+(1 row)
+
+RESET enable_seqscan;
+RESET pg_acorn.ef_search;
+-- (b) huge partition: gated recall within tolerance of ungated (the global graph
+--     serves the non-selective filter — payload edges add little here)
+SELECT acorn_recall('items_maxgate', 'bucket = 0', 'truth_huge', 400)
+     >= acorn_recall('items_nogate', 'bucket = 0', 'truth_huge', 400) - 0.05
+    AS maxgate_huge_recall_ge;
+ maxgate_huge_recall_ge 
+------------------------
+ t
+(1 row)
+
+-- (c) small partition (<= 500, NOT gated): top-10 identical to ungated -> the max
+--     gate only touches huge partitions (deterministic: serial + build_seed=42)
+SELECT acorn_top('items_maxgate', 'bucket = 5', 200)
+     = acorn_top('items_nogate', 'bucket = 5', 200) AS maxgate_small_unchanged;
+ maxgate_small_unchanged 
+-------------------------
+ t
+(1 row)
+
+-- NB: there is intentionally NO "gate changed the result" assertion — gating a
+-- huge non-selective partition is result-NEUTRAL by design (the global graph
+-- already serves the >=10% filter), so its effect is build-time only, verified
+-- on the VM.  Result-safety is asserted by (a)/(b)/(c); the part_count wiring is
+-- covered by the shared min-card path in tier2_payload_gate.sql.
+-- (d) VISIT CAP: a parallel two-pass build with a tight cap COMPLETES (no serial
+--     tail hang) and stays recall-correct on the huge partition.
+CREATE TABLE items_cap AS SELECT * FROM items_nogate;
+ALTER TABLE items_cap SET (parallel_workers = 4);
+SET max_parallel_maintenance_workers = 4;
+SET maintenance_work_mem = '8MB';
+SET pg_acorn.build_payload_two_pass = on;
+SET pg_acorn.build_payload_visit_cap = 200;
+SET client_min_messages = error;
+CREATE INDEX items_cap_idx ON items_cap
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+          acorn_payload_edges = true, acorn_payload_m = 64, acorn_diversify = false);
+RESET client_min_messages;
+RESET pg_acorn.build_payload_visit_cap;
+RESET pg_acorn.build_payload_two_pass;
+RESET maintenance_work_mem;
+RESET max_parallel_maintenance_workers;
+SELECT abs(acorn_recall('items_cap', 'bucket = 0', 'truth_huge', 400)
+         - acorn_recall('items_nogate', 'bucket = 0', 'truth_huge', 400)) <= 0.05
+    AS cap_huge_recall_parity;
+ cap_huge_recall_parity 
+------------------------
+ t
+(1 row)
+
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 400;
+SELECT bool_and(bucket = 0) AS cap_filter_correct, count(*) = 10 AS cap_returns_k
+FROM (SELECT bucket FROM items_cap WHERE bucket = 0
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+ cap_filter_correct | cap_returns_k 
+--------------------+---------------
+ t                  | t
+(1 row)
+
+RESET enable_seqscan;
+RESET pg_acorn.ef_search;
+DROP SCHEMA test_t2_maxgate CASCADE;
+NOTICE:  drop cascades to 7 other objects
+DETAIL:  drop cascades to table items_nogate
+drop cascades to table items_maxgate
+drop cascades to table truth_huge
+drop cascades to table truth_small
+drop cascades to function acorn_recall(text,text,text,integer)
+drop cascades to function acorn_top(text,text,integer)
+drop cascades to table items_cap

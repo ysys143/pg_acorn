@@ -94,6 +94,13 @@ int acorn_build_seed = -1;
 bool acorn_build_payload_two_pass = false;
 
 /*
+ * GUC: hard cap on same-partition nodes the two-pass payload search
+ * distance-evaluates per node (0 = unbounded/legacy).  Bounds pass-2 cost on
+ * huge, non-selective partitions whose partition subgraph is enormous.
+ */
+int acorn_build_payload_visit_cap = 0;
+
+/*
  * GUC: Tier 2 scan fast-path toggle — prefetch neighbor pages per expansion.
  * Default OFF: measured -10..-13% QPS on warm shared_buffers (every
  * PrefetchBuffer is a redundant buffer-table lookup when the page is already
@@ -349,6 +356,22 @@ _PG_init(void)
 		NULL,
 		&acorn_build_payload_two_pass,
 		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.build_payload_visit_cap */
+	DefineCustomIntVariable(
+		"pg_acorn.build_payload_visit_cap",
+		"Max same-partition nodes the two-pass payload search distance-evaluates "
+		"per node before stopping (0 = unbounded). Bounds pass-2 cost on huge, "
+		"non-selective partitions where the partition subgraph is enormous.",
+		NULL,
+		&acorn_build_payload_visit_cap,
+		0,			/* default: unbounded (no behavior change) */
+		0,			/* min */
+		INT_MAX,	/* max */
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL

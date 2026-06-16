@@ -70,6 +70,14 @@ acorn_am_init(void)
 					  ACORN_DEFAULT_PAYLOAD_MIN_CARD, ACORN_MIN_PAYLOAD_MIN_CARD,
 					  ACORN_MAX_PAYLOAD_MIN_CARD,
 					  AccessExclusiveLock);
+	add_int_reloption(acorn_relopt_kind, "acorn_payload_max_cardinality",
+					  "Skip payload edges for a node whose filter-value partition "
+					  "has MORE than this many members (0 = off); huge "
+					  "non-selective partitions rely on the global graph. "
+					  "Operational guidance: a few percent of the row count",
+					  ACORN_DEFAULT_PAYLOAD_MAX_CARD, ACORN_MIN_PAYLOAD_MAX_CARD,
+					  ACORN_MAX_PAYLOAD_MAX_CARD,
+					  AccessExclusiveLock);
 	add_bool_reloption(acorn_relopt_kind, "acorn_payload_edges",
 					   "Split layer-0 neighbor slots: half global nearest, "
 					   "half nearest within the same payload partition",
@@ -108,6 +116,7 @@ acorn_options(Datum reloptions, bool validate)
 		{"acorn_diversify", RELOPT_TYPE_BOOL, offsetof(AcornOptions, diversify)},
 		{"acorn_inline_vectors", RELOPT_TYPE_BOOL, offsetof(AcornOptions, inlineVectors)},
 		{"acorn_payload_min_cardinality", RELOPT_TYPE_INT, offsetof(AcornOptions, payloadMinCard)},
+		{"acorn_payload_max_cardinality", RELOPT_TYPE_INT, offsetof(AcornOptions, payloadMaxCard)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,

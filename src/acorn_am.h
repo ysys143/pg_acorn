@@ -78,6 +78,16 @@
 #define ACORN_MAX_PAYLOAD_MIN_CARD      1000000
 
 /*
+ * Symmetric high gate: skip payload edges for partitions LARGER than this (0 =
+ * off).  Huge, non-selective partitions are served well by the global HNSW
+ * graph, and their partition search dominates pass-2 build time, so payload
+ * edges add little but cost a lot.
+ */
+#define ACORN_DEFAULT_PAYLOAD_MAX_CARD  0
+#define ACORN_MIN_PAYLOAD_MAX_CARD      0
+#define ACORN_MAX_PAYLOAD_MAX_CARD      2000000000
+
+/*
  * Parsed reloptions for an acorn_hnsw index.  Layout must start with int32
  * vl_len_ for build_reloptions().
  */
@@ -92,6 +102,7 @@ typedef struct AcornOptions
 	bool		diversify;		/* HNSW diversity heuristic in neighbor selection */
 	bool		inlineVectors;	/* co-locate SQ8 vectors + metadata in neighbor lists */
 	int			payloadMinCard;	/* P4: skip payload edges for partitions smaller than this (0 = off) */
+	int			payloadMaxCard;	/* N2: skip payload edges for partitions larger than this (0 = off) */
 } AcornOptions;
 
 /* -----------------------------------------------------------------------

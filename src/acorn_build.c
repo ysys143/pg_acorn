@@ -143,6 +143,13 @@ acorn_opt_payload_min_card(Relation index)
 	return opts ? opts->payloadMinCard : ACORN_DEFAULT_PAYLOAD_MIN_CARD;
 }
 
+static int
+acorn_opt_payload_max_card(Relation index)
+{
+	AcornOptions *opts = (AcornOptions *) index->rd_options;
+	return opts ? opts->payloadMaxCard : ACORN_DEFAULT_PAYLOAD_MAX_CARD;
+}
+
 static bool
 acorn_opt_payload_edges(Relation index)
 {
@@ -980,6 +987,7 @@ typedef struct AcornMemBuild
 									 * when gating is off / counts unavailable
 									 * (parallel: points at shared->part_count) */
 	int				payload_min_card;	/* P4 threshold; 0 = off */
+	int				payload_max_card;	/* N2: skip payload for partitions > this; 0 = off */
 	MemoryContext	build_ctx;
 	/* maintenance_work_mem accounting (serial; parallel uses the arena) */
 	Size			mem_used;		/* bytes allocated for the graph so far */
@@ -1072,6 +1080,7 @@ acorn_mem_build_init(MemoryContext ctx)
 		mb->part_entry[p] = -1;
 	mb->part_count       = NULL;	/* P4: set when gating is active */
 	mb->payload_min_card = 0;
+	mb->payload_max_card = 0;
 	mb->mem_used    = mb->capacity * (sizeof(AcornMemNode) + sizeof(uint32))
 		+ sizeof(AcornMemBuild) + ACORN_PAYLOAD_PARTITIONS * sizeof(int);
 	mb->mem_total   = (Size) maintenance_work_mem * 1024;
@@ -1360,6 +1369,22 @@ acorn_mem_search_layer(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
  *
  * Returns up to ef same-partition node ids nearest-first.
  */
+
+/*
+ * Hard cap on same-partition distance evaluations per partition search
+ * (pg_acorn.build_payload_visit_cap; 0 = unbounded).  Floored at ef so the
+ * ef-sized result window is never starved.  Without this, a search over a huge
+ * non-selective partition (whose payload subgraph does not yet exist in pass 2)
+ * walks a large fraction of the global graph and serializes pass 2.
+ */
+static inline int
+acorn_partition_visit_cap(int ef)
+{
+	int cap = acorn_build_payload_visit_cap;
+
+	return (cap <= 0) ? INT_MAX : Max(cap, ef);
+}
+
 static int
 acorn_mem_search_partition(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 						   int entry_id, Datum query, int part, int ef,
@@ -1369,6 +1394,8 @@ acorn_mem_search_partition(AcornMemBuild *mb, const AcornDistCtx *dist, int m_ef
 	pairingheap   *C, *W;
 	int			   W_count = 0;
 	int			   n_out;
+	int			   visited = 0;
+	int			   visit_cap = acorn_partition_visit_cap(ef);
 
 	tmp_ctx = AllocSetContextCreate(mb->build_ctx, "acorn_mem_part_search",
 									ALLOCSET_SMALL_SIZES);
@@ -1405,6 +1432,8 @@ acorn_mem_search_partition(AcornMemBuild *mb, const AcornDistCtx *dist, int m_ef
 		f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
 		if (c_dist > f_dist && W_count >= ef)
 			break;
+		if (visited >= visit_cap)
+			break;				/* bound cost on huge partitions */
 
 		start   = HnswNeighborStart(m_eff, c_data->level, 0);
 		layer_m = acorn_t2_layer_m(0, m_eff, mb->payload_m);
@@ -1425,6 +1454,7 @@ acorn_mem_search_partition(AcornMemBuild *mb, const AcornDistCtx *dist, int m_ef
 			if (acorn_payload_partition(mb->nodes[nbr_id].filter_val) != part)
 				continue;	/* restricted to the partition subgraph */
 
+			visited++;		/* count same-partition distance evals (visit cap) */
 			nd     = acorn_dist(dist, acorn_node_vec(mb, &mb->nodes[nbr_id]),
 								query);
 			f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
@@ -1845,7 +1875,9 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 			int *g_sel    = palloc(sizeof(int) * g_half);
 			/* P4: gate payload edges for tiny partitions (filled with global below) */
 			bool gate     = (mb->part_count != NULL &&
-							 mb->part_count[part] < mb->payload_min_card);
+							 (mb->part_count[part] < mb->payload_min_card ||
+							  (mb->payload_max_card > 0 &&
+							   mb->part_count[part] > mb->payload_max_card)));
 
 			/* Global half: diversity-select up to g_half from the beam */
 			if (diversify)
@@ -2078,7 +2110,10 @@ acorn_mem_build_payload_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 	if (p_half <= 0)
 		return;
 	/* P4 gating: tiny partitions keep an empty payload half (scan tolerates -1) */
-	gate = (mb->part_count != NULL && mb->part_count[part] < mb->payload_min_card);
+	gate = (mb->part_count != NULL &&
+			(mb->part_count[part] < mb->payload_min_card ||
+			 (mb->payload_max_card > 0 &&
+			  mb->part_count[part] > mb->payload_max_card)));
 	if (gate)
 		return;
 
@@ -3926,6 +3961,7 @@ acorn_init_build_state(AcornBuildState *bs, Relation heap, Relation index,
 	bs->mb->payload_m      = acorn_payload_m_eff(index);
 	/* P4: payload gating threshold (0 = off); part_count wired by the caller */
 	bs->mb->payload_min_card = acorn_opt_payload_min_card(index);
+	bs->mb->payload_max_card = acorn_opt_payload_max_card(index);
 	bs->mb->inline_vectors = acorn_opt_inline_vectors(index);
 	bs->mb->dims           = dims;
 	bs->mb->entry_size     = bs->mb->inline_vectors
@@ -3950,7 +3986,8 @@ acorn_attach_shared(AcornBuildState *bs, AcornShared *shared, char *area)
 	mb->capacity   = shared->max_nodes;
 	mb->part_entry = shared->part_entry;
 	/* P4: parallel participants read the leader-filled shared partition counts */
-	if (mb->payload_min_card > 0 && shared->part_count_valid)
+	if ((mb->payload_min_card > 0 || mb->payload_max_card > 0) &&
+		shared->part_count_valid)
 		mb->part_count = shared->part_count;
 	/* per-process visited generations sized to the shared capacity */
 	mb->visit_gen  = (uint32 *)
@@ -4610,7 +4647,8 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 		parallel_workers = acorn_plan_parallel_workers(heap, index);
 	if (parallel_workers > 0)
 		acorn_begin_parallel(&bs, indexInfo->ii_Concurrent, parallel_workers,
-							 (bs.mb->payload_min_card > 0 && have_counts)
+							 (((bs.mb->payload_min_card > 0) ||
+							   (bs.mb->payload_max_card > 0)) && have_counts)
 							 ? part_count : NULL);
 
 	/*
@@ -4619,7 +4657,9 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 	 * acorn_attach_shared).  part_count stays NULL when gating is off or the
 	 * filter is not int4, so the gating check is a no-op then.
 	 */
-	if (bs.leader == NULL && bs.mb->payload_min_card > 0 && have_counts)
+	if (bs.leader == NULL &&
+		(bs.mb->payload_min_card > 0 || bs.mb->payload_max_card > 0) &&
+		have_counts)
 	{
 		bs.mb->part_count = (int *)
 			MemoryContextAlloc(bs.graph_ctx, sizeof(part_count));
