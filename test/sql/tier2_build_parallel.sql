@@ -180,6 +180,12 @@ FROM (SELECT bucket FROM items WHERE bucket < 5
 RESET enable_seqscan;
 RESET pg_acorn.ef_search;
 
+-- N1: the batch allocator's reserved-but-unwritten holes must be skipped at
+-- flush; if a DEAD hole leaked into a flushed element tuple, the index would
+-- carry phantom rows.  Exactly all 4000 rows must be present.
+SELECT c.reltuples::int = (SELECT count(*) FROM items) AS stress_no_phantom_tuples
+FROM pg_class c WHERE c.relname = 'items_stress_idx';
+
 -- Entry-CAS stress: a low m (=4) makes acorn_assign_level draw higher levels
 -- frequently, so many nodes race to publish themselves as the entry point
 -- (lock-free CAS-if-higher).  The parallel (4-worker) build must still reach
