@@ -1303,11 +1303,12 @@ acorn_mem_greedy_descend(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 static int
 acorn_mem_search_layer(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 					   int entry_id, Datum query, int layer, int ef,
-					   int *out_ids, double *out_dists)
+					   int visit_cap, int *out_ids, double *out_dists)
 {
 	MemoryContext  tmp_ctx, old_ctx;
 	pairingheap   *C, *W;
 	int			   W_count = 0;
+	int			   visited = 0;	/* N3: distance evals, for visit_cap (0 = unbounded) */
 	int			   n_out;
 
 	tmp_ctx = AllocSetContextCreate(mb->build_ctx, "acorn_mem_search",
@@ -1345,6 +1346,8 @@ acorn_mem_search_layer(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 		f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
 		if (c_dist > f_dist && W_count >= ef)
 			break;
+		if (visit_cap > 0 && visited >= visit_cap)
+			break;	/* N3: bound the backfill global-graph walk (pass-2 tail) */
 
 		if (c_data->level < layer)
 			continue;	/* safety: node doesn't appear at this layer */
@@ -1369,6 +1372,7 @@ acorn_mem_search_layer(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 
 			nd     = acorn_dist(dist, acorn_node_vec(mb, &mb->nodes[nbr_id]),
 								query);
+			visited++;	/* N3: count distance evals against visit_cap */
 			f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
 
 			if (nd < f_dist || W_count < ef)
@@ -1905,7 +1909,7 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 		int layer_m = acorn_t2_layer_m(lc, m_eff, mb->payload_m);
 		int start   = HnswNeighborStart(m_eff, level, lc);
 		int n_cands = acorn_mem_search_layer(mb, dist, m_eff,
-											  ep_id, q, lc, efc,
+											  ep_id, q, lc, efc, 0,
 											  out_ids, out_dists);
 
 		if (lc == 0 && mb->payload_edges && !mb->payload_two_pass)
@@ -2268,6 +2272,7 @@ acorn_mem_build_payload_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 				acorn_mem_greedy_descend(mb, dist, m_eff, &ep_id, q,
 										 entry_level, 0);
 			n_cands = acorn_mem_search_layer(mb, dist, m_eff, ep_id, q, 0, efc,
+											 acorn_partition_visit_cap(efc),
 											 out_ids, out_dists);
 
 			acorn_node_lock(mb, node, LW_EXCLUSIVE);
