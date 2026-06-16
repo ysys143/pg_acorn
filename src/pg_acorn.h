@@ -19,6 +19,8 @@ extern bool acorn_build_direct_dist;
 extern int  acorn_build_seed;
 extern bool acorn_build_payload_two_pass;
 extern int  acorn_build_payload_visit_cap;
+extern bool acorn_build_macorn_penalty;
+extern double acorn_build_macorn_penalty_factor;
 
 /* Tier 2 scan fast-path toggles (debug/benchmark) */
 extern bool acorn_scan_direct_dist;

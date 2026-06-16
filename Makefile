@@ -45,6 +45,7 @@ REGRESS = \
 	tier2_build_mwm \
 	tier2_build_parallel \
 	tier2_build_two_pass \
+	tier2_build_macorn \
 	tier2_payload_maxgate \
 	no_regression \
 	recall_filter \

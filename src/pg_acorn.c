@@ -93,6 +93,9 @@ int acorn_build_seed = -1;
  */
 bool acorn_build_payload_two_pass = false;
 
+bool   acorn_build_macorn_penalty = false;
+double acorn_build_macorn_penalty_factor = 1.0;
+
 /*
  * GUC: hard cap on same-partition nodes the two-pass payload search
  * distance-evaluates per node (0 = unbounded/legacy).  Bounds pass-2 cost on
@@ -372,6 +375,39 @@ _PG_init(void)
 		0,			/* default: unbounded (no behavior change) */
 		0,			/* min */
 		INT_MAX,	/* max */
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.build_macorn_penalty */
+	DefineCustomBoolVariable(
+		"pg_acorn.build_macorn_penalty",
+		"Bias HNSW neighbor selection toward same-partition (same filter "
+		"value) candidates at build time by inflating cross-partition "
+		"distances. Strengthens the predicate subgraph's connectivity "
+		"(M-ACORN). Off = standard nearest-only selection. Requires a filter "
+		"column; mutually exclusive with acorn_payload_edges.",
+		NULL,
+		&acorn_build_macorn_penalty,
+		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.build_macorn_penalty_factor */
+	DefineCustomRealVariable(
+		"pg_acorn.build_macorn_penalty_factor",
+		"M-ACORN cross-partition distance inflation: a candidate whose filter "
+		"partition differs from the base node has its distance multiplied by "
+		"(1 + factor) before neighbor selection. 0 = no bias even when "
+		"build_macorn_penalty is on.",
+		NULL,
+		&acorn_build_macorn_penalty_factor,
+		1.0,		/* default */
+		0.0,		/* min */
+		1e10,		/* max */
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL

@@ -988,6 +988,8 @@ typedef struct AcornMemBuild
 									 * (parallel: points at shared->part_count) */
 	int				payload_min_card;	/* P4 threshold; 0 = off */
 	int				payload_max_card;	/* N2: skip payload for partitions > this; 0 = off */
+	bool			macorn_penalty;		/* M-ACORN: bias neighbor selection toward same-partition */
+	double			macorn_penalty_factor;	/* cross-partition distance inflation = *(1+factor) */
 	MemoryContext	build_ctx;
 	/* maintenance_work_mem accounting (serial; parallel uses the arena) */
 	Size			mem_used;		/* bytes allocated for the graph so far */
@@ -1081,6 +1083,8 @@ acorn_mem_build_init(MemoryContext ctx)
 	mb->part_count       = NULL;	/* P4: set when gating is active */
 	mb->payload_min_card = 0;
 	mb->payload_max_card = 0;
+	mb->macorn_penalty = false;
+	mb->macorn_penalty_factor = 0.0;
 	mb->mem_used    = mb->capacity * (sizeof(AcornMemNode) + sizeof(uint32))
 		+ sizeof(AcornMemBuild) + ACORN_PAYLOAD_PARTITIONS * sizeof(int);
 	mb->mem_total   = (Size) maintenance_work_mem * 1024;
@@ -1493,6 +1497,43 @@ acorn_mem_search_partition(AcornMemBuild *mb, const AcornDistCtx *dist, int m_ef
 	MemoryContextSwitchTo(old_ctx);
 	MemoryContextDelete(tmp_ctx);
 	return n_out;
+}
+
+/*
+ * M-ACORN predicate-aware re-ranking: inflate the base distance of candidates
+ * whose payload partition differs from the base node's, then re-sort the
+ * (ids, dists) arrays ascending by the inflated distance.  Feeding the result
+ * to acorn_mem_select_diverse biases robust-prune toward same-partition
+ * neighbors, strengthening predicate-subgraph connectivity at build time.
+ * The arrays are sorted in place (caller's beam-search scratch, discarded
+ * after selection), preserving the ascending-distance precondition that
+ * acorn_mem_select_diverse and its keepPrunedConnections refill rely on.
+ */
+static void
+acorn_mem_macorn_rerank(AcornMemBuild *mb, int base_part, double factor,
+						int *ids, double *dists, int n)
+{
+	for (int i = 0; i < n; i++)
+	{
+		if (acorn_payload_partition(mb->nodes[ids[i]].filter_val) != base_part)
+			dists[i] *= (1.0 + factor);
+	}
+	/* insertion sort (ids,dists) jointly, ascending by dist; n <= efConstruction */
+	for (int i = 1; i < n; i++)
+	{
+		int    id = ids[i];
+		double d  = dists[i];
+		int    j  = i - 1;
+
+		while (j >= 0 && dists[j] > d)
+		{
+			dists[j + 1] = dists[j];
+			ids[j + 1]   = ids[j];
+			j--;
+		}
+		dists[j + 1] = d;
+		ids[j + 1]   = id;
+	}
 }
 
 /*
@@ -2013,6 +2054,12 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 				? m_eff : layer_m;
 			int  n_sel;
 			int *sel = palloc(sizeof(int) * fill_m);
+
+			if (mb->macorn_penalty)
+				acorn_mem_macorn_rerank(mb,
+										acorn_payload_partition(node->filter_val),
+										mb->macorn_penalty_factor,
+										out_ids, out_dists, n_cands);
 
 			if (diversify)
 				n_sel = acorn_mem_select_diverse(mb, dist, out_ids, out_dists,
@@ -3967,6 +4014,14 @@ acorn_init_build_state(AcornBuildState *bs, Relation heap, Relation index,
 	/* P4: payload gating threshold (0 = off); part_count wired by the caller */
 	bs->mb->payload_min_card = acorn_opt_payload_min_card(index);
 	bs->mb->payload_max_card = acorn_opt_payload_max_card(index);
+	/* M-ACORN: predicate-aware neighbor selection (needs a filter column) */
+	bs->mb->macorn_penalty = acorn_build_macorn_penalty && bs->has_filter;
+	bs->mb->macorn_penalty_factor = acorn_build_macorn_penalty_factor;
+	if (bs->mb->macorn_penalty && bs->mb->payload_edges)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pg_acorn.build_macorn_penalty cannot be combined with acorn_payload_edges"),
+				 errhint("M-ACORN penalty and payload edges are mutually exclusive predicate-connectivity strategies; disable one.")));
 	bs->mb->inline_vectors = acorn_opt_inline_vectors(index);
 	bs->mb->dims           = dims;
 	bs->mb->entry_size     = bs->mb->inline_vectors
