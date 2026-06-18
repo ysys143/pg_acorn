@@ -112,16 +112,54 @@ The same controlled runs reframe `acorn_payload_edges` (B3):
   than plain (e.g. lt5 ef=400: 0.957 vs 0.940), at ~2x latency.
 
 So B3's value is confined to **independent filters at high-recall operating
-points** -- consistent with production indexes running high ef. This is a
-200K / recall@10 reading; large-scale (per-bucket subgraphs ~100K at 10M)
-re-confirmation is left open.
+points**. Below, a 2M run tests how this scales.
+
+## Scale follow-up: plain vs B3 at 2M (independent filter)
+
+Serial deterministic builds at 2M (10x the 200K reading; per-bucket subgraph
+~20K vs ~2K). recall@10 + mean latency:
+
+| sel | ef | plain | b3 | d_recall | plain_ms | b3_ms |
+|-----|----|-------|-----|----------|----------|-------|
+| eq1 | 100 | 0.646 | 0.703 | +0.057 | 5.2 | 13.6 |
+| eq1 | 400 | 0.884 | 0.921 | +0.037 | 15.3 | 44.4 |
+| eq1 | 800 | 0.930 | 0.969 | +0.039 | 29.3 | 81.1 |
+| lt5 | 100 | 0.808 | 0.854 | +0.046 | 5.2 | 13.7 |
+| lt5 | 400 | 0.946 | 0.974 | +0.028 | 15.3 | 44.3 |
+| lt5 | 800 | 0.966 | 0.993 | +0.027 | 29.8 | 80.9 |
+
+Two trends vs 200K: (1) B3's recall advantage **grows with scale** and now spans
+the whole ef range (at 200K it was small and high-ef-only); bigger per-bucket
+subgraphs fragment the plain base graph more, so payload edges help more.
+(2) B3's latency penalty also grows -- now **1.6-2.8x** (was 1.3-2x).
+
+**Decisive frontier (QPS at a fixed recall target).** Because B3 costs ~2.6x
+per query, plain reaches any given recall at *lower* latency by simply raising
+ef -- up to ~0.93 recall:
+- recall 0.88: plain ef=400 @ 15ms vs B3 ~ef300 @ ~34ms -> plain wins
+- recall 0.93: plain ef=800 @ 29ms vs B3 ~ef450 @ ~50ms -> plain wins
+- recall >0.93 (e.g. 0.96): plain cannot reach within ef<=800; B3 only option
+
+So **plain dominates the recall-QPS frontier up to ~0.93; B3 only matters for the
+very-high-recall tail plain cannot reach** -- on independent filters. On the
+production *correlated* data, B3 is <= plain everywhere (above), so neither
+M-ACORN nor B3 beats plain there.
+
+(2M builds spilled to the on-disk path -- maintenance_work_mem=8GB was too small
+for a 2M graph -- so plain took 77min and B3 ~5h serially; build time is not part
+of this comparison, only the resulting recall/latency. The 10M parallel attempt
+was abandoned: it livelocked on the relation-extension LWLock, see
+`build-extension-lock-livelock` in project memory.)
 
 ## Disposition
 
 - Branch kept dormant; not merged. Prototype is default-off and inert.
 - Recommendation: do not pursue build-time predicate-edge biasing for pg_acorn
   (redundant with ACORN). Treat filtered recall at scan time (gamma / ef).
-- Open follow-up: re-confirm B3's high-ef independent-filter advantage at 10M.
+- B3 (payload_edges): keep, but its win is narrow -- independent filters needing
+  recall beyond what plain reaches. On correlated filters it is a net cost.
+- Open: 10M-scale needs serial or low-worker builds (parallel livelocks on the
+  extension lock); a bulk pre-extend in the build path would unblock parallel.
 
 See also `docs/literature-review-2025-06.md` (M-ACORN source) and
 `docs/build-perf-backlog.md`.
