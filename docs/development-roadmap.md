@@ -30,7 +30,7 @@
 
 | 한계 | 근거 | 영향 트랙 |
 |------|------|----------|
-| 고선택도+matched-recall에서 Qdrant latency 갭 (**배수 미해결/INDICATIVE**) | `REPORT_qdrant_final`(250K, cross-substrate)·`COMPETITIVE_VERDICT` | C |
+| 높은 통과율(10-20%)+matched-recall에서 Qdrant latency 갭 (**배수 미해결/INDICATIVE**) | `REPORT_qdrant_final`(250K, cross-substrate)·`COMPETITIVE_VERDICT` | C |
 | 대용량 빌드 **메모리 벽**: 그래프가 mwm 초과→on-disk 스필 | 2M@8GB·10M@32GB 실측 | B |
 | 병렬 빌드 **extension-lock 라이브락** (스필+다워커) | 10M/8워커 분당 2블록 정체 | B |
 | atomic allocator 회귀 (병렬 98 vs OLD 87분) | 빌드-perf 캠페인 | B |
@@ -70,6 +70,32 @@ M-ACORN·2-hop·N1 — `project-log.md` disproven) ④ 매 항해 후 `project-l
 
 ---
 
+## 전략적 포지셔닝 / 가치 명제
+
+**정밀화된 North Star**: "전용엔진에 필적"보다 정확히는 — *pgvector의 **구조적** 필터드 갭을,
+pgvector-호환 형태로 메운다* → **standalone niche + upstream 후보(양방향 승리)**.
+
+| 대상 | 그쪽의 필터드 검색 | pg_acorn의 자리 |
+|------|-------------------|-----------------|
+| **pgvector** | 보수적 scope. 0.8 iterative scan = 단순(인덱스 더 스캔). 우리 벤치서 **높은 통과율(10-20%)서 recall 0.22~0.50 붕괴** | pgvector가 의도적으로 단순히 푼 **구조적 갭** → 지속적. ACORN이 그 약점을 정조준 |
+| **pgvectorscale** | StreamingDiskANN + **smallint 라벨(`&&`)만** (Filtered DiskANN). raw ANN 스케일/속도가 강점 | **다른 칸** — 일반-술어 ACORN은 비어 있음. 단 그들의 on-disk 스케일은 우리 약점 |
+
+**upstream vs standalone (endgame)**: Tier 2(`acorn_hnsw`)는 pgvector HNSW 페이지 포맷 재사용 →
+**DiskANN과 달리 pgvector가 "받아먹기" 가능**(아키텍처 표 "Upstream PR target = yes"). 따라서
+가치는 양방향: (a) standalone "ACORN for Postgres", (b) pgvector upstream 기여. 둘 다 승리.
+
+**단, 완성 조건 (Tier 1/2 split)**: 일반-술어 우위는 **Tier 1 hook**(임의 WHERE qual을 `ExecQual`로
+평가, ACORN-1 search-time-only, upstream 불가)에서만 데모됨. 강한 인덱스(γ·payload·partition,
+upstream 대상)인 **Tier 2는 필터 모델이 좁음**(단일 int4 + identity-mod-256). → "일반-술어 + 강한
+인덱스"를 한 tier에 합치는 **Track D1이 niche 완성의 임계경로** (아래).
+
+> **용어(selectivity)**: 본 문서는 **PostgreSQL 플래너 관례 = 통과 행 비율**을 쓴다(sel 20% = 20% 통과
+> = "high"). 통상 어법("highly selective = few pass")과 *반대*라 혼동 위험 → 가능하면 **"통과율"**로
+> 명시한다(예: "20% 통과율"). Qdrant 갭은 **높은 통과율(10-20%)**에서, ACORN 강점은 **낮은 통과율
+> (0.1-1%, restrictive)**에서.
+
+---
+
 ## 개발 축 (트랙) — 메인(B/C/D) + 안정화(S, 1.0 게이트) + 강등된 A
 
 ### Track A — 쿼리 알고리즘: 2-hop은 시도·폐기됨 (강등)
@@ -105,7 +131,7 @@ M-ACORN·2-hop·N1 — `project-log.md` disproven) ④ 매 항해 후 `project-l
   또는 GUC 게이트로 OLD 경로 선택 가능하게.
 - **B4. spill 경로 견고화** — mwm 초과 시 graceful degrade (현재는 병렬 라이브락/직렬 초저속).
 
-### Track C — 경쟁 갭: 고선택도 latency (승부처)
+### Track C — 경쟁 갭: 높은 통과율(10-20%) latency (승부처)
 *왜*: **recall은 Qdrant와 parity**(Z3 후 0.97-1.0). 남은 건 **고선택도+matched-recall의 latency
 갭** — 단 **크기 미해결**(INDICATIVE, cross-substrate). 권위 판정은 `bench/COMPETITIVE_VERDICT.md`.
 ledger(`OVERHEAD_LEDGER.md`)가 최대 수정가능 항목을 이미 짚음: `acorn_stream_expand`의
@@ -121,8 +147,23 @@ ledger(`OVERHEAD_LEDGER.md`)가 최대 수정가능 항목을 이미 짚음: `ac
 > 주: 한때 저선택도용으로 기대했던 2-hop은 폐기됐고(Track A), 고선택도 갭은 애초에 별도 문제다.
 
 ### Track D — 데이터모델/스코프 확장 (장기 · 큰 결정)
-- **D1. 필터 모델 확장** — 현재 단일 int4 + 256 파티션(`filter_val & 255`) 한계. 멀티컬럼/
-  고카디널리티/범위 필터. 범위로 가면 SeRF/KHI 영역 = 새 AM/질의클래스 결정.
+- **D1. Tier-2 술어 모델 확장 — niche 완성 임계경로** (포지셔닝 참조). 현재 Tier 2는 단일 **int4 +
+  identity-mod-256**(`acorn_build.c:185`, "low-cardinality int4 가정: partition==value")만 강하게
+  처리. 일반-술어 우위를 *강한 인덱스*에 합치려면 아래를 다뤄야 함.
+  **핵심 렌즈 = 푸시다운 vs recheck**: 그래프 순회에 밀어넣을 술어 vs 인덱스 밖이라 post-filter
+  recheck(heap+술어 재평가)할 술어의 경계 설계. (Tier 1=전부 recheck-during-traversal, Tier 2=인덱싱한
+  것만 pushdown — 이 경계가 설계 축.)
+  - **타입**: int4 외 int8/numeric/text/uuid/timestamp/bool/enum/array/jsonb. `filter_val` int64 가정 → 해시/인코딩 일반화(+ text collation).
+  - **고카디널리티**: identity-mod-256 충돌(partition≠value) → payload 엣지 무의미. 해시 재설계/동적 파티션 수/per-value sub-index.
+  - **연산자**: `=`(현재)뿐. `IN`(파티션 합집합)·`<>`/`NOT`(여집합)·`IS NULL`·`LIKE`·배열(`&&`,`@>`,`ANY`).
+  - **범위(`BETWEEN`,`<`,`>`)**: 등식-파티션으로 표현 불가 → SeRF류 segment graph or 별도 질의클래스.
+  - **합성**: `AND`(교집합, 쉬움) vs **`OR`(서브그래프 합집합, 어려움)**, 중첩; 다중 컬럼(단일 slot→복합키/다차원).
+  - **표현식/함수**: `lower(c)=x`, `t::date=…` → expression-index or recheck.
+  - **런타임/조인 값**: `=$1`(prepared, 런타임 entry 선택), 조인 유래 필터(상수 아님).
+  - **분포/스큐/NULL**: 거대 단일 파티션, NULL-heavy, 비균등 저카디.
+  - **비용추정**: 위 복합·범위·OR 술어의 선택도 추정 → acorn vs bitmap vs seqscan 라우팅(plan-choice 진단 확장).
+  - **싼 interim (D1 전 main 반입 가능)**: max-card graceful-degrade(`payload_max_card`, N2가 build-perf
+    브랜치에 존재) → 고카디 파티션은 global-only 폴백 = 정확성+무회귀 보장(차별성은 없지만 퇴화 안전).
 - **D2. INCLUDE/컬럼나 필터 사본 (§13)** — 필터 컬럼 사본을 인덱스에 저장(PG11+ `INCLUDE`)해
   heap double-lookup 근본 제거. 논문 명시 장기 방향. 설계 스파이크부터.
 
