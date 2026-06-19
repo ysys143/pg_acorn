@@ -1,181 +1,148 @@
 # pg_acorn 발전 로드맵
 
-> 작성: 2026-06-08
-> 근거 문서: `docs/sigmod2026-fvs-postgresql-analysis.md` (SIGMOD 2026 FVS-in-PG 논문 분석)
-> 목적: 현재 구현에서 출발해 논문이 지적한 격차를 어떤 순서로 메울지 정의한다.
+> 최초 작성: 2026-06-08 (SIGMOD 2026 FVS-in-PG 분석 기반, 쿼리-side Phase 0→3)
+> 현 시점 재정리: 2026-06-19 — 3-way 벤치·스케일링, 빌드-perf 캠페인(B1-B4/N1-N4),
+> M-ACORN 음성 결론, extension-lock 라이브락 발견을 반영해 **트랙 구조로 재편**.
+> 근거 문서: `docs/sigmod2026-fvs-postgresql-analysis.md`, `docs/macorn-penalty-findings.md`,
+> `docs/build-perf-backlog.md`, `bench/REPORT_scale.md`, `bench/REPORT_3way.md`.
 
 ---
 
-## 0. 현재 상태 (baseline)
+## 0. 갱신된 baseline — 무엇이 끝났나
 
-| 구성 요소 | 상태 |
-|----------|------|
-| **Tier 1** (hook + CustomScan) | 필터 인지 ACORN-γ 탐색. WHERE 술어를 직접 봄. 전 선택도 recall 1.0 |
-| **Tier 2** (`acorn_hnsw` AM) | 멀티레이어 HNSW 빌드(이번 세션 완료) + ef 확장 반복 post-filter 스캔. recall@10 1%=1.0 |
-| **공유 탐색** (`acorn_scan.c`) | 멀티레이어 greedy descent(`:302`) + layer-0 ACORN 탐색(`:363`). **1-hop**, 필터 실패 노드는 C 유지(`:471`) |
-| **ACORN-γ** | `m_eff = m×gamma` 이웃을 빌드 시 저장(`acorn_build.c:80`), `meta->m`에 기록 |
-| **벤치마크** | scenario A–D 하네스, 합성 unit 벡터, **page-I/O 미측정** |
+| 영역 | 상태 |
+|------|------|
+| 멀티레이어 HNSW 빌드 / ACORN-γ / 공유 탐색 (Tier 1 hook + Tier 2 `acorn_hnsw` AM) | 완료 |
+| **Phase 0 (측정·안전)**: page-I/O 계측, L_max(gamma-clamp) 경고, resume 스트리밍 스캔, 비용모델 재보정 | **완료** |
+| 실데이터 + Qdrant + 3-way 스케일링 (100K/1M/10M) | **완료** (`REPORT_scale`/`REPORT_3way`) |
+| Qdrant 차용 5종 (payload_m, auto-ef, payload-gate, telemetry, plan-choice) | 완료 |
+| code-cache 스캔 최적화 | 완료 (default ON) |
+| 빌드-perf 캠페인 (B1-B4, N1-N4) | 완료 — N4 CV-broadcast 버그 수정, two-pass/N1 음성 결론 |
+| M-ACORN (빌드-시 predicate penalty) | **음성 결론** — ACORN scan-time gamma와 중복, 휴면 (`feat/macorn-penalty`) |
 
-### 논문 대비 격차 (멀티레이어 빌드 완료 후 갱신)
+원래 로드맵의 **Phase 0는 사실상 닫혔다** (유일 잔여: `ef_search` C 상한 — 저우선 보류). 미해결 잔여:
+`ef_search` C 상한(`acorn_scan.c:515` TODO, 저우선).
 
-분석 문서 Section 11의 "최우선 격차(멀티레이어 HNSW)"는 **이미 해소됨**. 남은 격차:
+### 측정으로 확정된 격차/한계 (이 로드맵의 구동력)
 
-| 격차 | 논문 근거 | 난이도 | 위험 | 적용 위치 |
-|------|----------|--------|------|----------|
-| page-I/O 미측정 | §1, §12.4 | 소 | 매우 낮음 | bench |
-| 실데이터/Qdrant/시나리오 B–D 미실행 | §6, §8 | 중 | 낮음 | bench |
-| ACORN-γ L_max 경고 없음 | §10, §12.3 | 극소 | 매우 낮음 | `acorn_build.c` |
-| ef_search C 상한 (코드에 TODO) | §11 | 소 | 낮음 | `acorn_scan.c:515` |
-| Tier 2 반복 스캔이 ef 2배마다 전체 재탐색 | (자체 측정) | 중 | 낮음 | `acorn_am.c:253` |
-| Translation Map 없음 | §5, §12.1 | 대 | 중 | `acorn_build.c`+`acorn_scan.c` |
-| 런타임 2-hop (ACORN-1) 없음 | §4, §6.1 | 대 | 중 | `acorn_scan.c` |
-| NaviX-Directed 없음 | §6.1, §8, §12.2 | 중 | 중 | `acorn_scan.c` |
-| 컬럼나/INCLUDE 컬럼 | §13 | 특대 | 높음 | 아키텍처 |
+| 한계 | 근거 | 영향 트랙 |
+|------|------|----------|
+| 고선택도에서 Qdrant 대비 **1.6~4.4배 느림** | 3-way 벤치 | C |
+| 대용량 빌드 **메모리 벽**: 그래프가 mwm 초과→on-disk 스필 | 2M@8GB·10M@32GB 실측 | B |
+| 병렬 빌드 **extension-lock 라이브락** (스필+다워커) | 10M/8워커 분당 2블록 정체 | B |
+| atomic allocator 회귀 (병렬 98 vs OLD 87분) | 빌드-perf 캠페인 | B |
+| 직렬 빌드 꼬리 (WAL flush ~16분/82GB + P_NEW 한장씩) | 캠페인 + 라이브락 진단 | B |
+| 쿼리 동시처리 **미검증** (throughput INDICATIVE) | 본 세션 | E |
+| 단일 노드 / int4·256-파티션 필터 모델 | 코드 구조 | D |
 
 ---
 
-## 의존성 그래프 (로드맵 순서의 근거)
+## 개발 축 — 3 메인 트랙 + 2 보조
+
+### Track A — 쿼리 알고리즘 프런티어 (연구 간판 · 장기 차별화)
+원 로드맵 Phase 1→2. *왜*: 오픈소스 PostgreSQL 최초의 제대로 된 graph-based filtered
+vector search (SIGMOD §7). NaviX·TM은 AlloyDB 구독으로도 못 쓰는 연구 프로토타입.
+
+- **A1. Translation Map** (`indextid → heaptid` 인메모리 `HTAB`, SIGMOD §5) — 2-hop의 전제.
+  빌드 후 전체 1회 스캔으로 구성, 엔트리 ~18B (1M=18MB, 35M=630MB). 쿼리 시 필터 평가 경로의
+  heaptid 해석을 ~10ns 조회로 대체. 중난이도.
+  > 1-hop은 이미 element 튜플을 읽어 heaptid가 공짜이므로, TM의 실익은 A2가 생겨야 발생 → A2와 묶어 검증.
+- **A2. 런타임 2-hop (ACORN-1, §4·§6.1)** — γ=1로 저장비용 없이 effective density 확보.
+  A1 위에서만 실행 가능 (2-hop은 스텝당 1+M+M² 페이지). pgvector 페이지 천장(§10)에 막히는
+  초대규모·초저선택도 영역을 연다. 대난이도.
+- **A3. NaviX-Directed (§12.2)** — 1-hop을 거리순 정렬 → 가까운 비통과 노드의 2-hop 먼저.
+  논문상 ACORN 대비 1.2~1.7x. A2 위에서만.
+- **회귀 가드 (필수)**: 이 변경들은 Tier 1 공유 `acorn_scan.c`를 건드림. 가법적으로 γ=1만 2-hop,
+  γ>1은 기존 동작 보존. 머지 게이트: `no_regression.sql`(acorn==pgvector top-k) + `recall_filter`,
+  ≥40% 선택도 recall ≥0.9. 효과는 Phase 0 `pages_per_query`로 증명.
+
+### Track B — 빌드 확장성/성능 (대용량 enabler · 본 세션 신규 트랙)
+*왜*: 대용량의 실질 한계가 빌드 메모리 벽 + 직렬/라이브락임을 측정으로 확인. 상세는
+`docs/build-perf-backlog.md`, 라이브락은 프로젝트 메모리 `build-extension-lock-livelock`.
+
+- **B1. 벌크 사전확장 (최우선)** — `ReadBufferExtended(P_NEW)` 한장씩(`acorn_build.c:304`) →
+  HNSW가 아는 최종 노드/페이지 수로 `smgrzeroextend` 일괄 확장 후 사전할당 블록에 기록.
+  **병렬 빌드 extension-lock 라이브락 제거** + 직렬 빌드도 가속. flush 코드 한정, 중난이도.
+- **B2. flush 병렬화** — 직렬 `log_newpage_range` flush(~16분/82GB at 10M)를 워커 분산.
+- **B3. atomic allocator 회귀 정리** — B1/B2 lock-free 할당의 캐시라인 바운싱(98 vs 87분) 완화
+  또는 GUC 게이트로 OLD 경로 선택 가능하게.
+- **B4. spill 경로 견고화** — mwm 초과 시 graceful degrade (현재는 병렬 라이브락/직렬 초저속).
+
+### Track C — 경쟁 갭: 고선택도 latency (승부처)
+*왜*: 측정상 고선택도에서 Qdrant 1.6~4.4배 느림 — 유일하게 명확한 패배 지점.
+
+- **C1. 고선택도 경로 프로파일링** — 시간 소비 분해(그래프 순회 vs heap fetch vs 거리계산).
+  처방의 전제. 저위험 진입.
+- **C2. 원인별 처방** — 후보 C 상한(`ef_search` cap, 기존 TODO), 거리계산 SIMD/양자화,
+  heap fetch 절감(→ Track D2 INCLUDE 연결). C1 결과로 결정.
+
+> Track A(2-hop)는 저선택도·초대규모를 열지만, 고선택도 갭은 별도 문제라 C로 분리.
+
+### Track D — 데이터모델/스코프 확장 (장기 · 큰 결정)
+- **D1. 필터 모델 확장** — 현재 단일 int4 + 256 파티션(`filter_val & 255`) 한계. 멀티컬럼/
+  고카디널리티/범위 필터. 범위로 가면 SeRF/KHI 영역 = 새 AM/질의클래스 결정.
+- **D2. INCLUDE/컬럼나 필터 사본 (§13)** — 필터 컬럼 사본을 인덱스에 저장(PG11+ `INCLUDE`)해
+  heap double-lookup 근본 제거. 논문 명시 장기 방향. 설계 스파이크부터.
+
+### Track E — 검증/운영 (지속)
+- **E1. 쿼리 동시처리 실측 (미검증)** — 멀티클라이언트 QPS 코어 스케일링, 락/공유버퍼 병목.
+  코드상 동시 스캔 대응 흔적(overlapping scan ref, backend-local 카운터)은 있으나 부하 실측 없음.
+- **E2. latency/throughput 정밀 측정** — 현재 INDICATIVE 단계 탈출(측정 환경 확정).
+- **E3. index-fits-in-RAM 특성화**, 단일노드 천장 문서화.
+
+---
+
+## 의존성 그래프 / 시퀀스
 
 ```
-Phase 0 (측정·안전)  ──┬──> Phase 1 (TM) ──> Phase 2 (2-hop ─> NaviX-Directed)
-                       │         ▲                    │
-   page-I/O 계측 ───────┘         └── 효과 증명 의존 ───┘
-   실데이터 하네스                                      │
-   L_max 경고 / ef 상한 / 반복스캔 재개                 v
-                                              Phase 3 (타 알고리즘·컬럼나)
+[지금]
+ ├─ C1 (고선택도 프로파일링) ─────────→ C2 처방        ← 측정된 패배 지점, 저위험 진입
+ ├─ B1 (벌크 사전확장) ──→ B2/B4                        ← 대용량 빌드 잠금 해제, 자족적
+ └─ A1 (Translation Map) ─→ A2 (2-hop) ─→ A3 (NaviX)   ← 연구 간판, 길고 Tier1 회귀 위험
+                                  │
+[E1/E2 측정]은 A·C 효과 증명의 전제 ┘
 ```
 
-**왜 이 순서인가**: 논문은 "distance 계산 수는 PG end-to-end의 신뢰할 수 없는 proxy"라고 단언한다(§1). 따라서 **page-I/O 측정 없이는 TM/2-hop이 실제로 페이지 접근을 줄였는지 증명할 수 없다.** TM은 2-hop을 PG에서 실행 가능하게 만드는 전제(2-hop은 스텝당 1+M+M² 페이지, §4)이며, NaviX-Directed는 2-hop 위에서만 의미가 있다.
+**왜 이 순서인가**: (1) C·B는 *측정으로 확정된 한계*를 직접 공략하고 자족적이라 즉시 가치.
+(2) A는 가장 큰 차별화지만 길고 Tier 1 회귀 위험이 있어, B1/C1로 빠른 가치를 확보한 뒤 본격 착수.
+(3) SIGMOD §1: "distance 계산 수는 PG end-to-end의 신뢰 못 할 proxy" → page-I/O(Phase 0 완료) 없이는
+A의 효과 증명 불가. A2는 A1 없이는 PG에서 실행 불가(2-hop 페이지 폭증), A3는 A2 위에서만 의미.
 
----
+## 우선순위 요약
 
-## Phase 0 — 측정 기반 + 안전장치 (전제 조건)
+| 순위 | 항목 | 근거 |
+|------|------|------|
+| **P0** | C1 고선택도 프로파일링 | 측정된 유일 패배 지점, 진입 저위험 |
+| **P0** | B1 벌크 사전확장 | 대용량 빌드 라이브락 제거 — 자족적, 영향 큼 |
+| **P1** | A1 Translation Map → A2 2-hop | 연구 차별화, 저선택도·초대규모 개방 |
+| **P1** | E1 동시처리 실측 | "기본기 OK?" 미검증분 종결 |
+| **P2** | A3 NaviX / B2 flush / C2 처방 | 상위 의존 |
+| **P3** | D 데이터모델 / 컬럼나 | 큰 아키텍처 결정, 실데이터 음상관 결과 보고 |
 
-목표: 이후 모든 최적화를 **증명 가능**하게 만들고, 저위험 정합성 항목을 닫는다.
-
-> 진행: [x] page-I/O 계측 · [x] L_max(gamma-clamp) 경고 · [x] Tier 2 재개 스캔 ·
-> [ ] ef_search C 상한 · [ ] 실데이터/Qdrant/B–D. (커밋: `9481116`·`7dc4390`·`55fe795`·`e7ee9a9`·`d710ae0`, 브랜치 `bench-page-io`)
-
-1. **[완료] page-I/O 계측** (`bench/`, §12.4)
-   - `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`로 `shared_hit + shared_read` 추출 → `pages_per_query` 지표.
-   - `bench/results.json`·`RESULTS.md` 리포트에 `QPS`/`recall@10`/`p99`와 **나란히 필수 컬럼으로** 추가.
-   - 산출물: 현재 ACORN-γ의 쿼리당 페이지 접근 baseline. 이후 TM/2-hop의 효과를 이 숫자로 측정.
-
-2. **실데이터 하네스 보강** (`bench/fixtures/`, `bench/targets/qdrant.py`)
-   - 합성 unit 벡터 → 실 SIFT/Cohere 임베딩. 음의 상관관계 시나리오 포함(§8.2 — 논문의 가장 가혹한 케이스).
-   - Qdrant 타깃 활성화 + 시나리오 B(post-filter 저하)/C(증분 insert)/D(상관관계) 정식 실행.
-
-3. **[완료] ACORN-γ gamma-clamp 경고** (`acorn_build.c`, §12.3) — 극소, 독립적
-   - 레벨이 `ACORN_MAX_LEVEL`로 이미 캡되어 페이지 오버플로는 불가능 → 논문의 `l_max<10`은
-     dead code. 실제 발화 가치가 있는 케이스로 조정: `m*gamma > HNSW_MAX_M`일 때 `m_eff`가
-     조용히 100으로 clamp되어 gamma가 완전히 적용되지 않음을 `ereport(WARNING)` + `errhint`.
-   - 검증: gamma=8(m=16)에서 발화, gamma=2에서 무발화. 회귀 7/7 통과.
-
-4. **[보류] ef_search C 상한** (`acorn_scan.c:515` TODO) — 소, 저우선
-   - 후보 C 상한은 ACORN 저선택도 연결성(recall)에 민감하고 원저자가 의도적으로 미룬 최적화.
-     강행 시 recall 강검증 필요. 재개 스캔 도입으로 무한 탐색 위험은 이미 완화됨(streaming은
-     executor LIMIT 충족 시 정지) → 우선순위 낮음.
-
-5. **[완료] Tier 2 재개 스캔 (순수 스트리밍)** (`acorn_scan.c` `acorn_stream_*` + `acorn_am.c`) — 중
-   - ef-doubling batch(매 확장마다 entry point부터 전체 재탐색)를 streaming frontier로 교체.
-     각 노드 1회 확장·방출 → 재탐색 제거. Tier 1 batch 경로는 불변(격리).
-   - 결과(RESULTS.md Run 4, 인덱스 강제): g1 @ 1% 63,000→**19,638** 페이지(3.2배↓), recall
-     1.000→0.998. 전 구간 index-scan 페이지 2–4배↓. 회귀 7/7 + 격리 2/2 + 단위 10/10 통과.
-   - 주: 한때 hybrid(batch+stream)를 시도했으나, 그 동기였던 "g2@1% 회귀"가 실은 플래너의
-     seqscan 선택(측정 교란)이었음이 밝혀져 되돌림. [[bench-force-index-confound]] 참고.
-
-6. **[완료] `acorn_cost.c` 비용 모델 재보정** — emit 튜플당 그래프 확장 페이지 비용
-   (`ACORN_PAGES_PER_TUPLE`)로 변경. 이전엔 startup을 `total*(logN/N)`로 거의 0으로 만들어
-   플래너가 저선택도에서 인덱스를 오선택했음.
-   - 검증: 1%/10k에서 g1이 이제 Seq Scan(cost 496) 선택 — 이전 Index Scan(2.59) 오선택 교정.
-     g1·g2·1%·80% 모두 10k에선 seqscan(정상: 소규모는 seqscan이 인덱스보다 쌈). 인덱스는
-     large-N(>~23k행)에서 승리 — 구조적으로 보장(인덱스 유효비용 ~상수 vs seqscan ∝ N),
-     단 large-N 실측은 항목 2 필요. 회귀 7/7 + 격리 2/2 통과.
-   - tier2_am의 잘못된 force-index edit은 되돌림(쿼리가 `<->`를 cosine 인덱스에 써서 인덱스
-     사용 불가 — lenient seqscan fallback이 의도된 동작). [[bench-force-index-confound]] 참고.
-
-**완료 기준**: `pages_per_query`가 모든 타깃 리포트에 존재, 실데이터로 시나리오 A–D 통과, `make docker-test`/`docker-unit` 회귀 없음.
-
----
-
-## Phase 1 — Translation Map (2-hop의 전제)
-
-목표: `indextid → heaptid` 인메모리 해시맵으로 2-hop 술어 평가 시 인덱스 페이지 재조회 제거(§5).
-
-- **빌드 시** (`acorn_build.c`, 인덱스 완성 후): 전체 인덱스 1회 스캔으로 `HTAB` 구성. 엔트리당 ~18B (1M=18MB, 35M=630MB).
-  ```c
-  typedef struct AcornTranslationMap {
-      HTAB *indextid_to_heaptid;
-      MemoryContext mcxt;
-  } AcornTranslationMap;
-  ```
-- **쿼리 시** (`acorn_scan.c`): 필터 평가 경로에서 heaptid 해석을 TM 조회(~10ns)로 대체.
-- **검증**: Phase 0의 `pages_per_query`로 heaptid fetch 비용 하락 확인(논문 §5: 60–75% → 8–17%).
-
-> 주의: 현재 1-hop 경로는 노드를 distance 계산하며 element 튜플을 이미 읽어 heaptid가 공짜다. **TM의 실익은 2-hop이 생겨야 발생**하므로 Phase 2와 묶어 검증한다.
-
----
-
-## Phase 2 — 2-hop ACORN-1 + NaviX-Directed (논문의 간판)
-
-목표: 런타임 2-hop 확장으로, 저장 비용 없이(γ=1) effective density 확보. pgvector 페이지 천장(§10)에 막히는 초대규모·초저선택도 영역을 연다.
-
-1. **런타임 2-hop 확장** (`acorn_scan.c`, §4·§6.1) — TM 위에서만 실행 가능.
-2. **NaviX-Directed** (§12.2): 1-hop을 거리순 정렬 → 가까운 비통과 노드의 2-hop 먼저 탐색. 논문상 ACORN 대비 1.2–1.7x.
-3. **(선택) Adaptive heuristic 전환**: Blind/Directed/Onehop-s를 탐색 상태(C/W 채움률·통과율)로 동적 선택(§6.1).
-
-### 아키텍처 제약 — Tier 1 회귀 방지
-
-이 변경들은 Tier 1이 공유하는 `acorn_scan.c`를 건드린다. **회귀 가드 필수**:
-- 가법적으로: γ=1 경로는 런타임 2-hop을 쓰고, γ>1(현재 ACORN-γ) 경로는 기존 동작 보존.
-- `no_regression.sql`(acorn==pgvector top-k) + `recall_filter` 통과, ≥40% 선택도 recall ≥0.9 유지를 머지 게이트로.
-
-**전략적 가치**: TM + 2-hop + NaviX-Directed가 들어가면 pg_acorn은 **오픈소스 PostgreSQL 최초의 제대로 된 graph-based filtered vector search**가 된다(§7). NaviX·TM은 AlloyDB 구독으로도 못 쓰는 연구 프로토타입.
-
----
-
-## Phase 3 — 타 알고리즘 / 장기 방향
-
-- **ScaNN형 클러스터 인덱스** (§6.3): 음의 상관관계에서 유일한 승자. 별도 AM 규모의 큰 작업 — 채택 여부는 Phase 0 실데이터 결과(음상관 시나리오)를 보고 결정.
-- **컬럼나 / INCLUDE 컬럼** (§13): 필터 컬럼 사본을 인덱스에 저장(PG 11+ `INCLUDE`)해 heap double-lookup을 근본 제거. 논문이 명시한 장기 방향. 설계 스파이크부터.
-
----
+## 권장 다음 1~2 액션
+1. **B1 (벌크 사전확장)** — 대용량 빌드 라이브락/저속을 정공법으로 제거. 자족적·즉시 가치, A/C와 독립.
+2. **C1 (고선택도 프로파일링)** — Qdrant 갭 원인 분해. C2 처방의 전제.
 
 ---
 
 ## 부록 — 신규 알고리즘 지형 (FAVOR / JAG / Curator / SeRF / KHI)
 
-"이것들은 더 나중인가?"에 대한 답: **대부분 Phase 3 이후**. 단, 세 게이트로 *언제*가 갈린다.
-
-- **G1 아키텍처 적합**: filter-agnostic이며 pgvector 페이지 포맷(`hnsw_compat.h`)을 재사용 가능한가?
-- **G2 문제 동일성**: 속성 **동등** WHERE 술어 문제인가? (범위 필터/멀티테넌트는 다른 문제)
-- **G3 PG 검증**: PG에서 우위가 입증됐는가? (Phase 0 측정 전엔 전부 미지)
+대부분 Track D(스코프 확장) 이후. 세 게이트로 *언제*가 갈린다.
+- **G1 아키텍처 적합**: filter-agnostic이며 pgvector 페이지 포맷(`hnsw_compat.h`) 재사용 가능?
+- **G2 문제 동일성**: 속성 *동등* WHERE 술어 문제? (범위/멀티테넌트는 다른 문제)
+- **G3 PG 검증**: PG에서 우위 입증? (Phase 0 측정 전엔 전부 미지)
 
 | 알고리즘 | 계열 | G1 | G2 | 배치 | 비고 |
 |---------|------|----|----|------|------|
-| **FAVOR** ([2605.07770](https://arxiv.org/abs/2605.07770)) | filter-agnostic graph (HNSW) | O | O | **Phase 2.5 후보** | ACORN/NaviX의 사촌. selectivity-aware exclusion distance. NaviX-Directed의 대안 휴리스틱으로 평가 가능 |
-| **Curator** ([2401.07119](https://arxiv.org/abs/2401.07119), [2601.01291](https://arxiv.org/abs/2601.01291)) | 파티션/트리 (per-label) | X | △ | Phase 3 | ScaNN 계열. 저선택도·멀티테넌트·음상관 보완. 새 AM 필요 |
-| **JAG** ([2602.10258](https://arxiv.org/abs/2602.10258)) | attribute graph (filter-specific) | X | O | Phase 3+ | 속성을 그래프에 결합. 새 디스크 포맷/AM 필요 |
-| **SeRF** ([SIGMOD'24](https://miaoqiao.github.io/paper/SIGMOD24_SeRF.pdf)) | range-filter segment graph | X | X | Phase 3+ | **범위 필터** 전용. 질의 클래스 확장 결정 필요 |
-| **KHI** | 다속성 파티션 트리 + per-node HNSW | X | X | Phase 3+ | 다속성 범위 RFANNS. 질의 클래스 확장 + 새 AM |
+| **FAVOR** ([2605.07770](https://arxiv.org/abs/2605.07770)) | filter-agnostic graph (HNSW) | O | O | **Track A 2.5 후보** | ACORN/NaviX의 사촌. selectivity-aware exclusion distance. NaviX-Directed 대안 휴리스틱 |
+| **Curator** ([2401.07119](https://arxiv.org/abs/2401.07119)) | 파티션/트리 (per-label) | X | △ | Track D | ScaNN 계열. 저선택도·멀티테넌트·음상관 보완. 새 AM |
+| **JAG** ([2602.10258](https://arxiv.org/abs/2602.10258)) | attribute graph | X | O | Track D+ | 속성을 그래프에 결합. 새 디스크 포맷/AM |
+| **SeRF** ([SIGMOD'24](https://miaoqiao.github.io/paper/SIGMOD24_SeRF.pdf)) | range-filter segment graph | X | X | Track D+ | 범위 필터 전용. 질의 클래스 확장 결정 |
+| **KHI** | 다속성 파티션 트리 + per-node HNSW | X | X | Track D+ | 다속성 범위 RFANNS. 새 AM |
 
-**해석**
-- **부류 A (FAVOR)**: 우리 filter-agnostic graph 계열. 유일하게 기존 Tier 1/2 구조에 끼울 수 있어 Phase 2와 가깝다.
-- **부류 B (JAG/Curator/SeRF/KHI)**: 필터를 인덱스에 박아넣는 specialized index. pgvector 페이지 포맷 재사용 전제를 깨고 **새 AM**을 요구하거나, **다른 질의 클래스(범위 필터)** 지원 결정을 요구한다. 따라서 "채택"이 아니라 "방향 전환"이며 Phase 3 이후.
-- 공통: 전부 standalone 라이브러리 벤치마크 결과뿐 → **PG 우위는 Phase 0 page-I/O 계측 이후에만 판단 가능**. 그 전까지는 research-watch 대상.
+- **부류 A (FAVOR)**: 우리 filter-agnostic graph 계열 → Track A에 가깝게 끼울 수 있음.
+- **부류 B (JAG/Curator/SeRF/KHI)**: 필터를 인덱스에 박는 specialized index → 새 AM/다른 질의클래스.
+  "채택"이 아니라 "방향 전환", Track D 이후. 전부 standalone 벤치 결과뿐 → PG 우위는 측정 후 판단.
 
-> 참고 서베이: RF-ANNS 분류 체계 [arXiv:2505.06501](https://arxiv.org/abs/2505.06501), FANNS 벤치마크 [arXiv:2507.21989](https://arxiv.org/html/2507.21989v1).
-
----
-
-## 우선순위 요약
-
-| 순위 | 항목 | 이유 |
-|------|------|------|
-| P0 | page-I/O 계측 | 다른 모든 작업의 증명 도구 |
-| P0 | L_max 경고 / ef 상한 / 반복스캔 재개 | 저위험, 즉시 정합성·성능 이득 |
-| P0 | 실데이터 + Qdrant + 시나리오 B–D | 의미 있는 측정 기반 |
-| P1 | Translation Map | 2-hop 전제 |
-| P2 | 2-hop ACORN-1 + NaviX-Directed | 논문 간판, 대규모·저선택도 개방 |
-| P3 | ScaNN / 컬럼나 | 장기, 큰 아키텍처 결정 |
-```
+> 서베이: RF-ANNS 분류 [arXiv:2505.06501](https://arxiv.org/abs/2505.06501),
+> FANNS 벤치 [arXiv:2507.21989](https://arxiv.org/html/2507.21989v1).
