@@ -7,7 +7,8 @@
 > 다중세션, 1.0 게이트)** 추가.
 > 근거 문서: `docs/project-log.md`(마스터 원장), `bench/COMPETITIVE_VERDICT.md`(경쟁판정 SSOT),
 > `docs/sigmod2026-fvs-postgresql-analysis.md`, `docs/macorn-penalty-findings.md`,
-> `docs/build-perf-backlog.md`, `bench/OVERHEAD_LEDGER.md`.
+> `docs/build-perf-backlog.md`, `bench/OVERHEAD_LEDGER.md`,
+> `docs/issue678-vdbbench-gap-analysis.md`(베이스라인 정직성 — [pgvector#678](https://github.com/pgvector/pgvector/issues/678)).
 
 ---
 
@@ -168,7 +169,7 @@ ledger(`OVERHEAD_LEDGER.md`)가 최대 수정가능 항목을 이미 짚음: `ac
 
 - **C0. (전제) 깨끗한 재측정** — same-protocol·median-basis(prepared·literal·median+p99 분리),
   >=200K에서 Qdrant 갭 magnitude 확정. "1.6-4.4x"는 이게 끝나기 전엔 사실로 인용 금지.
-  - **C0b. iterative_scan 정합 베이스라인 (pgvector #678 — 메인테이너 본인 설계)**: 현재 우리 측정은
+  - **C0b. iterative_scan 정합 베이스라인 ([pgvector#678](https://github.com/pgvector/pgvector/issues/678) — 메인테이너 본인 설계)**: 현재 우리 측정은
     `strict_order` + `max_scan_tuples=40000`만(recall 0.22~0.50). **그러나 #678(ankane 2372612113/
     2390036999/2428287137)이 명시한 스캔 종료조건은 *튜플충족 | max_scan_tuples | work_mem* 중 최초 도달
     — 기본 work_mem(우리 fair-config 4MB)에선 후보힙이 수천에서 차므로 `max_scan_tuples=40000`이 절대
